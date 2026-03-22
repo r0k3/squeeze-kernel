@@ -1,0 +1,298 @@
+"""Core streaming Squeeze Kernel covariance estimator."""
+
+from __future__ import annotations
+
+import numpy as np
+
+from squeeze_kernel.kernels import (
+    KernelFn, kernel_fisher, calibrate_kappa, extract_d2_series,
+)
+
+
+class SqueezeKernelEstimator:
+    """Streaming robust covariance estimator with pluggable kernel weighting.
+
+    The estimator is positive semi-definite by construction at every time step,
+    handles missing observations natively, and separates volatility and
+    correlation dynamics through dual-timescale EWMAs.  An adaptive
+    equicorrelation shrinkage rule automatically calibrates regularisation
+    to the concentration ratio n / T_eff.
+
+    Parameters
+    ----------
+    n_assets : int
+        Number of assets.
+    lambda_vol : float
+        Decay factor for per-asset volatility EWMA (default 0.94).
+    lambda_corr : float
+        Decay factor for correlation EWMA (default 0.99).
+    kappa : float, optional
+        Saturation parameter for the default Fisher kernel (default 1.5).
+    kernel_fn : callable, optional
+        Custom kernel ``(d2, *, n_observed, **kw) -> float``.
+        If omitted, the estimator uses ``kernel_fisher``.
+    kernel_kwargs : dict, optional
+        Extra keyword arguments forwarded to ``kernel_fn``.
+        Use this to configure alternative kernels such as
+        ``kernel_exponential(gamma=...)``.
+    epsilon : float
+        Numerical floor (default 1e-8).
+    shrinkage : str or float
+        ``'auto'`` (default) for adaptive shrinkage,
+        ``0`` or ``'none'`` to disable, or a float in [0, 1] for fixed intensity.
+    shrinkage_delta : float
+        Threshold for adaptive shrinkage (default 0.10).
+    impute_missing : bool
+        If True, impute missing standardized returns from correlated assets.
+    impute_threshold : float
+        Minimum |correlation| for imputation donors (default 0.6).
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> returns = np.random.default_rng(42).normal(0.0, 0.01, size=(250, 3))
+    >>> est = SqueezeKernelEstimator(n_assets=3, kappa=1.5)
+    >>> for r_t in returns:
+    ...     est.update(r_t)
+    >>> cov = est.get_cov()
+    >>> corr = est.get_corr()
+    """
+
+    def __init__(
+        self,
+        n_assets: int,
+        *,
+        lambda_vol: float = 0.94,
+        lambda_corr: float = 0.99,
+        kappa: float | None = None,
+        kernel_fn: KernelFn | None = None,
+        kernel_kwargs: dict[str, object] | None = None,
+        epsilon: float = 1e-8,
+        shrinkage: str | float = "auto",
+        shrinkage_delta: float = 0.10,
+        impute_missing: bool = False,
+        impute_threshold: float = 0.6,
+    ):
+        self.n_assets = n_assets
+        self.lambda_vol = lambda_vol
+        self.lambda_corr = lambda_corr
+        self.epsilon = epsilon
+        self.impute_missing = impute_missing
+        self.impute_threshold = impute_threshold
+        self.shrinkage_delta = shrinkage_delta
+
+        # Resolve shrinkage
+        if isinstance(shrinkage, str):
+            self._shrinkage_alpha = -1.0 if shrinkage == "auto" else 0.0
+        else:
+            self._shrinkage_alpha = float(shrinkage)
+
+        # Resolve kernel
+        self._kernel_fn, self._kernel_kwargs = _resolve_kernel(kappa, kernel_fn, kernel_kwargs)
+        self.kappa = self._kernel_kwargs.get("kappa") if self._kernel_fn is kernel_fisher else None
+
+        # State
+        self._var_t: np.ndarray | None = None
+        self._var_init: np.ndarray | None = None
+        self._M_t = np.eye(n_assets, dtype=np.float64) * epsilon
+        self._S_t = float(epsilon)
+        self._cov: np.ndarray | None = None
+        self._corr: np.ndarray | None = None
+        self._last_weight: float = 0.0
+
+    # ── Public API ────────────────────────────────────────────────────────
+
+    def update(self, r_t) -> float:
+        """Process one return vector and update the covariance estimate.
+
+        Parameters
+        ----------
+        r_t : array-like, shape (n_assets,)
+            Return vector.  May contain NaN for missing assets.
+
+        Returns
+        -------
+        float
+            Kernel weight w_t assigned to this observation.
+        """
+        r_t = np.asarray(r_t, dtype=np.float64)
+        n = self.n_assets
+        eps = self.epsilon
+        if r_t.shape != (n,):
+            raise ValueError(f"Expected shape ({n},), got {r_t.shape}.")
+
+        finite = np.isfinite(r_t)
+
+        # ── Volatility EWMA ──
+        if self._var_t is None:
+            self._var_t = np.zeros(n, dtype=np.float64)
+            self._var_init = np.zeros(n, dtype=bool)
+
+        first = finite & ~self._var_init
+        repeat = finite & self._var_init
+        if np.any(first):
+            self._var_t[first] = r_t[first] ** 2 + eps
+            self._var_init[first] = True
+        if np.any(repeat):
+            self._var_t[repeat] = (
+                self.lambda_vol * self._var_t[repeat]
+                + (1.0 - self.lambda_vol) * r_t[repeat] ** 2
+            )
+
+        vol_t = np.zeros(n, dtype=np.float64)
+        vol_t[self._var_init] = np.sqrt(self._var_t[self._var_init])
+
+        # ── Standardized returns ──
+        z_t = np.zeros(n, dtype=np.float64)
+        n_obs = int(finite.sum())
+        if n_obs > 0:
+            z_t[finite] = r_t[finite] / (vol_t[finite] + eps)
+            d2 = float(z_t[finite] @ z_t[finite]) / n_obs
+            w_t = self._kernel_fn(d2, n_observed=n_obs, **self._kernel_kwargs)
+        else:
+            w_t = 0.0
+
+        # ── Imputation ──
+        if self.impute_missing and 0 < n_obs < n:
+            self._impute(z_t, finite)
+
+        # ── Correlation EWMA ──
+        self._S_t = self.lambda_corr * self._S_t + w_t
+        self._M_t = self.lambda_corr * self._M_t
+        if w_t > 0.0 and n_obs > 0:
+            self._M_t += w_t * np.outer(z_t, z_t)
+
+        # ── Extract covariance ──
+        self._cov, self._corr = self._extract(vol_t)
+        self._last_weight = w_t
+        return w_t
+
+    def get_cov(self) -> np.ndarray:
+        """Return the current covariance matrix estimate (n x n)."""
+        if self._cov is None:
+            raise RuntimeError("Call update() at least once before get_cov().")
+        return self._cov.copy()
+
+    def get_corr(self) -> np.ndarray:
+        """Return the current correlation matrix estimate (n x n)."""
+        if self._corr is None:
+            raise RuntimeError("Call update() at least once before get_corr().")
+        return self._corr.copy()
+
+    @property
+    def weight(self) -> float:
+        """Kernel weight assigned to the most recent observation."""
+        return self._last_weight
+
+    @property
+    def effective_sample_size(self) -> float:
+        """Kernel-weighted effective sample size S_t."""
+        return self._S_t
+
+    @property
+    def shrinkage_intensity(self) -> float:
+        """Current adaptive shrinkage intensity alpha_t."""
+        if self._shrinkage_alpha >= 0:
+            return self._shrinkage_alpha
+        n = self.n_assets
+        return max(0.0, min(1.0, n / (2.0 * max(self._S_t, self.epsilon)) - self.shrinkage_delta))
+
+    @staticmethod
+    def calibrate_kappa(
+        returns, target_weight: float = 0.5, lambda_vol: float = 0.94,
+    ) -> float:
+        """Calibrate κ from burn-in data so E[w_t] ≈ target_weight.
+
+        Parameters
+        ----------
+        returns : array-like, shape (T, n)
+            Burn-in return data.
+        target_weight : float
+            Target average kernel weight in (0, 1).
+        lambda_vol : float
+            Volatility decay factor used for standardization.
+
+        Returns
+        -------
+        float
+            Calibrated κ value.
+        """
+        d2 = extract_d2_series(returns, lambda_vol=lambda_vol)
+        return calibrate_kappa(d2, target_weight)
+
+    # ── Private helpers ───────────────────────────────────────────────────
+
+    def _impute(self, z_t: np.ndarray, finite: np.ndarray) -> None:
+        eps = self.epsilon
+        denom = max(self._S_t, eps)
+        sigma_z = self._M_t / denom
+        diag_z = np.diag(sigma_z)
+        inv_diag = 1.0 / np.sqrt(np.maximum(diag_z, eps))
+        missing = ~finite
+        for i in range(self.n_assets):
+            if not missing[i]:
+                continue
+            num = den = 0.0
+            for j in range(self.n_assets):
+                if not finite[j]:
+                    continue
+                c_ij = sigma_z[i, j] * inv_diag[i] * inv_diag[j]
+                if abs(c_ij) < self.impute_threshold:
+                    continue
+                num += c_ij * z_t[j]
+                den += abs(c_ij)
+            if den > 0.0:
+                z_t[i] = num / den
+
+    def _extract(self, vol_t: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        eps = self.epsilon
+        sigma_z = self._M_t / max(self._S_t, eps)
+        diag_z = np.diag(sigma_z)
+        inv_diag = 1.0 / np.sqrt(np.maximum(diag_z, eps))
+
+        corr = sigma_z * np.outer(inv_diag, inv_diag)
+        np.fill_diagonal(corr, np.where(diag_z > eps, 1.0, 0.0))
+
+        # Adaptive shrinkage
+        alpha = self._shrinkage_alpha
+        n = corr.shape[0]
+        if alpha < 0:
+            alpha = max(0.0, min(1.0, n / (2.0 * max(self._S_t, eps)) - self.shrinkage_delta))
+        if alpha > 0.0 and n > 1:
+            mask = ~np.eye(n, dtype=bool)
+            rho_bar = float(corr[mask].mean())
+            target = np.full_like(corr, rho_bar)
+            np.fill_diagonal(target, 1.0)
+            corr = (1.0 - alpha) * corr + alpha * target
+            np.fill_diagonal(corr, 1.0)
+
+        cov = corr * np.outer(vol_t, vol_t)
+        cov = (cov + cov.T) * 0.5
+        corr = (corr + corr.T) * 0.5
+        return cov, corr
+
+
+# ── Kernel resolution ─────────────────────────────────────────────────────────
+
+def _resolve_kernel(
+    kappa: float | None,
+    kernel_fn: KernelFn | None,
+    kernel_kwargs: dict[str, object] | None,
+) -> tuple[KernelFn, dict[str, object]]:
+    kw = dict(kernel_kwargs) if kernel_kwargs else {}
+
+    if kernel_fn is not None:
+        if kappa is not None:
+            raise ValueError(
+                "Pass kernel-specific parameters via kernel_kwargs when kernel_fn is set."
+            )
+        return kernel_fn, kw
+
+    if "kappa" in kw and kappa is not None:
+        raise ValueError("Pass kappa either as a top-level argument or in kernel_kwargs, not both.")
+
+    resolved_kappa = float(kw.get("kappa", 1.5 if kappa is None else kappa))
+    if resolved_kappa <= 0.0:
+        raise ValueError("kappa must be > 0.")
+    kw["kappa"] = resolved_kappa
+    return kernel_fisher, kw

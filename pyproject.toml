@@ -1,0 +1,38 @@
+[build-system]
+requires = ["uv_build>=0.10.6,<0.11.0"]
+build-backend = "uv_build"
+
+[project]
+name = "squeeze-kernel"
+version = "0.1.0"
+description = "Streaming covariance estimator with Fisher-kernel weighting and adaptive shrinkage"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "Robert Kende" }]
+keywords = ["covariance", "correlation", "ewma", "kernel", "risk", "streaming"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+]
+dependencies = ["numpy>=1.24"]
+
+[project.urls]
+Homepage = "https://github.com/r0k3/squeeze-kernel"
+Repository = "https://github.com/r0k3/squeeze-kernel"
+Issues = "https://github.com/r0k3/squeeze-kernel/issues"
+
+[project.optional-dependencies]
+full = ["scipy>=1.11"]
+dev = ["pytest>=7.0", "ruff>=0.7", "scipy>=1.11"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
