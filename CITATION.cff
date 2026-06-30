@@ -1,0 +1,28 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata below."
+title: "Squeeze Kernel Covariance Estimator"
+type: software
+version: "0.1.0"
+license: MIT
+repository-code: "https://github.com/r0k3/squeeze-kernel"
+url: "https://github.com/r0k3/squeeze-kernel"
+abstract: >-
+  Streaming covariance estimator with Fisher-kernel weighting and adaptive
+  shrinkage.
+keywords:
+  - covariance
+  - correlation
+  - ewma
+  - kernel
+  - risk
+  - streaming
+authors:
+  - family-names: "Kende"
+    given-names: "Robert"
+preferred-citation:
+  type: article
+  authors:
+    - family-names: "Kende"
+      given-names: "Robert"
+  title: "The Squeeze Kernel Covariance Estimator: Dual-Timescale Tracking with Adaptive Shrinkage"
+  year: 2026

@@ -100,6 +100,13 @@ class SqueezeKernelEstimator:
         self._corr: np.ndarray | None = None
         self._last_weight: float = 0.0
 
+        # Cached scratch buffers reused per ``update()`` to avoid per-step
+        # allocator churn. These are intentionally module-private and
+        # never escape the estimator.
+        self._scratch_outer = np.empty((n_assets, n_assets), dtype=np.float64)
+        self._scratch_corr = np.empty((n_assets, n_assets), dtype=np.float64)
+        self._n_off = float(n_assets * (n_assets - 1)) if n_assets > 1 else 1.0
+
     # ── Public API ────────────────────────────────────────────────────────
 
     def update(self, r_t) -> float:
@@ -123,7 +130,7 @@ class SqueezeKernelEstimator:
 
         finite = np.isfinite(r_t)
 
-        # ── Volatility EWMA ──
+        # ── Volatility update ──
         if self._var_t is None:
             self._var_t = np.zeros(n, dtype=np.float64)
             self._var_init = np.zeros(n, dtype=bool)
@@ -156,11 +163,14 @@ class SqueezeKernelEstimator:
         if self.impute_missing and 0 < n_obs < n:
             self._impute(z_t, finite)
 
-        # ── Correlation EWMA ──
+        # ── Correlation EWMA (in-place to avoid per-step allocations) ──
         self._S_t = self.lambda_corr * self._S_t + w_t
-        self._M_t = self.lambda_corr * self._M_t
+        self._M_t *= self.lambda_corr
         if w_t > 0.0 and n_obs > 0:
-            self._M_t += w_t * np.outer(z_t, z_t)
+            # np.multiply.outer with out= avoids the temporary that
+            # np.outer otherwise allocates each step.
+            np.multiply.outer(z_t, z_t, out=self._scratch_outer)
+            self._M_t += w_t * self._scratch_outer
 
         # ── Extract covariance ──
         self._cov, self._corr = self._extract(vol_t)
@@ -246,30 +256,50 @@ class SqueezeKernelEstimator:
 
     def _extract(self, vol_t: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         eps = self.epsilon
-        sigma_z = self._M_t / max(self._S_t, eps)
-        diag_z = np.diag(sigma_z)
-        inv_diag = 1.0 / np.sqrt(np.maximum(diag_z, eps))
+        S_t = max(self._S_t, eps)
+        n = self.n_assets
 
-        corr = sigma_z * np.outer(inv_diag, inv_diag)
+        # Normalised standardised covariance matrix sigma_z = M_t / S_t.
+        # Compute correlations directly into the cached scratch buffer to
+        # avoid two intermediate allocations (sigma_z and corr).
+        diag_z = np.diagonal(self._M_t).copy()
+        diag_z /= S_t                                # in-place
+        inv_diag = 1.0 / np.sqrt(np.maximum(diag_z, eps))
+        # corr_ij = (M_ij / S_t) * inv_diag_i * inv_diag_j; this writes
+        # the rescaled outer-product into _scratch_corr in one pass.
+        np.multiply.outer(inv_diag, inv_diag, out=self._scratch_corr)
+        corr = self._scratch_corr
+        corr *= self._M_t                            # in-place; corr = sigma_z * outer(inv_diag,inv_diag)
+        corr *= (1.0 / S_t)                          # absorb the M_t / S_t scale
         np.fill_diagonal(corr, np.where(diag_z > eps, 1.0, 0.0))
 
-        # Adaptive shrinkage
+        # Adaptive shrinkage: blend toward the equicorrelation target
+        # T = (1 - rho_bar) I + rho_bar 11'.  We avoid materialising T by
+        # blending the off-diagonal toward rho_bar in place and resetting
+        # the diagonal to 1.
         alpha = self._shrinkage_alpha
-        n = corr.shape[0]
         if alpha < 0:
-            alpha = max(0.0, min(1.0, n / (2.0 * max(self._S_t, eps)) - self.shrinkage_delta))
+            alpha = max(0.0, min(1.0, n / (2.0 * S_t) - self.shrinkage_delta))
         if alpha > 0.0 and n > 1:
-            mask = ~np.eye(n, dtype=bool)
-            rho_bar = float(corr[mask].mean())
-            target = np.full_like(corr, rho_bar)
-            np.fill_diagonal(target, 1.0)
-            corr = (1.0 - alpha) * corr + alpha * target
+            # Off-diagonal mean: O(n^2) sum, no mask allocation.
+            rho_bar = (corr.sum() - corr.trace()) / self._n_off
+            corr *= (1.0 - alpha)
+            corr += alpha * rho_bar
             np.fill_diagonal(corr, 1.0)
 
+        # Build covariance from corr and vol_t.  We need an output array
+        # that the caller can keep, so allocate one cov here (cannot reuse
+        # corr buffer because both are returned).
         cov = corr * np.outer(vol_t, vol_t)
-        cov = (cov + cov.T) * 0.5
-        corr = (corr + corr.T) * 0.5
-        return cov, corr
+        # Defensive symmetrisation against floating-point asymmetry.
+        cov += cov.T
+        cov *= 0.5
+        # Return a copy of corr so callers see a stable snapshot even if
+        # the next update() overwrites the scratch buffer.
+        corr_out = corr.copy()
+        corr_out += corr_out.T
+        corr_out *= 0.5
+        return cov, corr_out
 
 
 # ── Kernel resolution ─────────────────────────────────────────────────────────
