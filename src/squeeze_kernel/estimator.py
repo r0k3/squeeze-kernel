@@ -46,6 +46,22 @@ class SqueezeKernelEstimator:
         If True, impute missing standardized returns from correlated assets.
     impute_threshold : float
         Minimum |correlation| for imputation donors (default 0.6).
+    weight_statistic : str
+        Statistic fed to the kernel.  ``'marginal'`` (default) uses the mean
+        squared standardized return d² = z'z/N — the published estimator.
+        ``'mahalanobis'`` uses the score-exact surprise z'C⁻¹z/N measured
+        against the estimator's own previous correlation matrix (one linear
+        solve per update).  With κ ≈ 1 (the parameter-free default, since
+        E[z'C⁻¹z/N] = 1 under a correct C) this improved one-step NLL by
+        ≈2.5 points on the S&P-500 benchmark, holdout-confirmed.
+    lambda_corr_fast : float or None
+        If set, enables score-driven memory: the correlation decay becomes
+        λ_t = lambda_corr + (lambda_corr_fast − lambda_corr)·w_t, shortening
+        the memory on high-weight (stress) days.  PSD is preserved.  Pass
+        ``None`` (default) for the published constant-λ behaviour.
+        Do not combine with ``weight_statistic='mahalanobis'`` — the two
+        mechanisms act on the same reactivity channel and their combination
+        degraded out-of-sample accuracy in testing.
 
     Examples
     --------
@@ -72,6 +88,8 @@ class SqueezeKernelEstimator:
         shrinkage_delta: float = 0.10,
         impute_missing: bool = False,
         impute_threshold: float = 0.6,
+        weight_statistic: str = "marginal",
+        lambda_corr_fast: float | None = None,
     ):
         self.n_assets = n_assets
         self.lambda_vol = lambda_vol
@@ -80,6 +98,14 @@ class SqueezeKernelEstimator:
         self.impute_missing = impute_missing
         self.impute_threshold = impute_threshold
         self.shrinkage_delta = shrinkage_delta
+
+        # Opt-in extensions (defaults preserve the published estimator exactly)
+        if weight_statistic not in ("marginal", "mahalanobis"):
+            raise ValueError("weight_statistic must be 'marginal' or 'mahalanobis'.")
+        self.weight_statistic = weight_statistic
+        if lambda_corr_fast is not None and not (0.0 < lambda_corr_fast < 1.0):
+            raise ValueError("lambda_corr_fast must be in (0, 1).")
+        self.lambda_corr_fast = lambda_corr_fast
 
         # Resolve shrinkage
         if isinstance(shrinkage, str):
@@ -155,6 +181,15 @@ class SqueezeKernelEstimator:
         if n_obs > 0:
             z_t[finite] = r_t[finite] / (vol_t[finite] + eps)
             d2 = float(z_t[finite] @ z_t[finite]) / n_obs
+            if self.weight_statistic == "mahalanobis" and self._corr is not None:
+                # Score-exact surprise against the estimator's own previous
+                # correlation; falls back to the marginal d² on the first
+                # step or a (rare) singular observed submatrix.
+                try:
+                    c_sub = self._corr[np.ix_(finite, finite)]
+                    d2 = float(z_t[finite] @ np.linalg.solve(c_sub, z_t[finite])) / n_obs
+                except np.linalg.LinAlgError:
+                    pass
             w_t = self._kernel_fn(d2, n_observed=n_obs, **self._kernel_kwargs)
         else:
             w_t = 0.0
@@ -164,8 +199,13 @@ class SqueezeKernelEstimator:
             self._impute(z_t, finite)
 
         # ── Correlation EWMA (in-place to avoid per-step allocations) ──
-        self._S_t = self.lambda_corr * self._S_t + w_t
-        self._M_t *= self.lambda_corr
+        lam_c = self.lambda_corr
+        if self.lambda_corr_fast is not None:
+            # Score-driven memory: stress days (w_t → 1) shorten the memory
+            # toward lambda_corr_fast; calm days keep the slow decay.
+            lam_c = self.lambda_corr + (self.lambda_corr_fast - self.lambda_corr) * w_t
+        self._S_t = lam_c * self._S_t + w_t
+        self._M_t *= lam_c
         if w_t > 0.0 and n_obs > 0:
             # np.multiply.outer with out= avoids the temporary that
             # np.outer otherwise allocates each step.

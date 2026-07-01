@@ -211,3 +211,76 @@ class TestMissingData:
         err_no = abs(est_no.get_cov()[0, 1] - ref_01)
         err_yes = abs(est_yes.get_cov()[0, 1] - ref_01)
         assert err_yes < err_no
+
+
+class TestExtensions:
+    """Opt-in extensions: Mahalanobis weight statistic and score-driven memory."""
+
+    def _run(self, est, x):
+        for r in x:
+            est.update(r)
+        return est.get_cov()
+
+    def test_defaults_unchanged(self, rng):
+        """Extension defaults must reproduce the base estimator bit-for-bit."""
+        x = rng.normal(0, 0.01, size=(300, 5))
+        base = self._run(SqueezeKernelEstimator(5, kappa=1.0), x)
+        ext = self._run(SqueezeKernelEstimator(5, kappa=1.0, weight_statistic="marginal",
+                                               lambda_corr_fast=None), x)
+        assert np.array_equal(base, ext)
+
+    def test_lambda_fast_equal_slow_is_identity(self, rng):
+        """lambda_corr_fast == lambda_corr must be exactly the base estimator."""
+        x = rng.normal(0, 0.01, size=(300, 5))
+        base = self._run(SqueezeKernelEstimator(5, kappa=1.0, lambda_corr=0.99), x)
+        same = self._run(SqueezeKernelEstimator(5, kappa=1.0, lambda_corr=0.99,
+                                                lambda_corr_fast=0.99), x)
+        assert np.allclose(base, same)
+
+    def test_mahalanobis_first_step_matches_marginal(self, rng):
+        """Before a correlation estimate exists, mahalanobis falls back to marginal."""
+        est_m = SqueezeKernelEstimator(4, kappa=1.0, weight_statistic="mahalanobis")
+        est_b = SqueezeKernelEstimator(4, kappa=1.0)
+        r0 = rng.normal(0, 0.01, 4)
+        assert est_m.update(r0) == pytest.approx(est_b.update(r0))
+
+    def test_mahalanobis_psd_and_divergence(self, rng):
+        """Mahalanobis variant stays PSD every step and eventually differs from base."""
+        x = rng.normal(0, 0.01, size=(400, 6))
+        x[:, 1] = 0.8 * x[:, 0] + 0.2 * x[:, 1]  # give the panel real correlation
+        est_m = SqueezeKernelEstimator(6, kappa=1.0, weight_statistic="mahalanobis")
+        est_b = SqueezeKernelEstimator(6, kappa=1.0)
+        for t in range(400):
+            est_m.update(x[t])
+            est_b.update(x[t])
+            eig = np.linalg.eigvalsh(est_m.get_cov())
+            assert eig.min() >= -1e-12
+        assert not np.allclose(est_m.get_cov(), est_b.get_cov())
+
+    def test_scorem_psd_and_divergence(self, rng):
+        """Score-driven memory stays PSD every step and differs from base."""
+        x = rng.normal(0, 0.01, size=(400, 6))
+        est_f = SqueezeKernelEstimator(6, kappa=1.0, lambda_corr=0.996, lambda_corr_fast=0.99)
+        est_b = SqueezeKernelEstimator(6, kappa=1.0, lambda_corr=0.996)
+        for t in range(400):
+            est_f.update(x[t])
+            est_b.update(x[t])
+            eig = np.linalg.eigvalsh(est_f.get_cov())
+            assert eig.min() >= -1e-12
+        assert not np.allclose(est_f.get_cov(), est_b.get_cov())
+
+    def test_invalid_arguments_raise(self):
+        with pytest.raises(ValueError):
+            SqueezeKernelEstimator(3, weight_statistic="bogus")
+        with pytest.raises(ValueError):
+            SqueezeKernelEstimator(3, lambda_corr_fast=1.5)
+
+    def test_mahalanobis_with_missing_data(self, rng):
+        """Masked updates keep working under the mahalanobis statistic."""
+        x = rng.normal(0, 0.01, size=(300, 5))
+        x[50::7, 2] = np.nan
+        est = SqueezeKernelEstimator(5, kappa=1.0, weight_statistic="mahalanobis")
+        for t in range(300):
+            w = est.update(x[t])
+            assert 0.0 <= w < 1.0
+        assert np.isfinite(est.get_cov()).all()
