@@ -53,7 +53,13 @@ class SqueezeKernelEstimator:
         against the estimator's own previous correlation matrix (one linear
         solve per update).  With κ ≈ 1 (the parameter-free default, since
         E[z'C⁻¹z/N] = 1 under a correct C) this improved one-step NLL by
-        ≈2.5 points on the S&P-500 benchmark, holdout-confirmed.
+        ≈2.5 points on the S&P-500 n=100 benchmark, holdout-confirmed.
+        IMPORTANT — regime-dependent: the advantage inverts in the
+        high-concentration regime (≈12 NLL worse at n=200 and ≈61 worse at
+        n=300 with T_eff = 250), because the estimated inverse inflates the
+        statistic as n approaches T_eff, saturating the kernel and weakening
+        the adaptive shrinkage.  Use only when n/T_eff ≲ 0.5; the marginal
+        default is the concentration-robust choice at every dimension.
     lambda_corr_fast : float or None
         If set, enables score-driven memory: the correlation decay becomes
         λ_t = lambda_corr + (lambda_corr_fast − lambda_corr)·w_t, shortening
