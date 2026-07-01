@@ -12,9 +12,9 @@ Quick start::
 
     returns = np.random.default_rng(42).normal(0.0, 0.01, size=(250, 3))
 
-    # Defaults to the Fisher kernel; pass kernel_fn/kernel_kwargs
-    # to use alternatives such as kernel_exponential.
-    est = SqueezeKernelEstimator(n_assets=3, kappa=1.5)
+    # Defaults (lambda_vol=0.98, lambda_corr=0.996, kappa=0.25) are the
+    # paper-recommended settings for panels of daily financial returns.
+    est = SqueezeKernelEstimator(n_assets=3)
     for r_t in returns:
         est.update(r_t)
 
@@ -34,4 +34,4 @@ __all__ = [
     "kernel_chi2_cdf",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

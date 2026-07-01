@@ -1,171 +1,133 @@
 # Squeeze Kernel Covariance Estimator
 
 [![CI](https://github.com/r0k3/squeeze-kernel/actions/workflows/ci.yml/badge.svg)](https://github.com/r0k3/squeeze-kernel/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/squeeze-kernel.svg)](https://pypi.org/project/squeeze-kernel/)
+[![Python](https://img.shields.io/pypi/pyversions/squeeze-kernel.svg)](https://pypi.org/project/squeeze-kernel/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-A streaming, PSD-by-construction covariance estimator with adaptive shrinkage for financial applications.
+A **streaming covariance estimator for panels of daily financial returns**. One `O(n²)` update per day, positive semi-definite **by construction** at every step, missing values handled **natively**, and defaults that require no tuning. Only dependency: NumPy.
 
-**Paper:** "The Squeeze Kernel Covariance Estimator: Dual-Timescale Tracking with Adaptive Shrinkage" (Kende, 2026)
+Reference: *"The Squeeze Kernel Covariance Estimator: Dual-Timescale Tracking with Adaptive Shrinkage"* (Kende, 2026).
 
-## Features
+## Why
 
-- **PSD by construction** at every time step (no eigenvalue clipping needed)
-- **Adaptive shrinkage** automatically calibrates regularisation to the dimension/sample-size ratio
-- **Native missing data handling** via masked EWMA updates
-- **O(n²) streaming** — single-pass, no matrix decomposition during online operation
-- **Pluggable kernels** — Fisher (default), exponential, χ² CDF, or custom
+Rolling-window estimators (Ledoit–Wolf, nonlinear shrinkage, RMT denoising) refit over a fixed window each day and cannot adapt within it; multivariate GARCH (DCC) adapts but needs multi-stage estimation and a fragile news coefficient. The Squeeze Kernel is a single streaming recursion that:
+
+- **is PSD at every step, structurally** — never needs eigenvalue clipping, nearest-PSD projection, or a solver;
+- **adapts fastest exactly when it matters** — a Fisher-information kernel up-weights high-dispersion (stress) days, when correlation regimes actually move;
+- **regularises itself** — an adaptive equicorrelation shrinkage activates automatically as the asset count approaches the effective sample size, with a provable condition-number bound;
+- **ingests missing values natively** — listings, delistings, and halts enter as `NaN`; no imputation or complete-case subsetting;
+- **is fast** — a full 30-year daily pass takes ~0.75 s at n=100 and ~3.4 s at n=300 (single-threaded), 30–40× faster than rolling-window baselines at scale.
+
+On a 30-year S&P 500 panel (n=100, ~7,600 out-of-sample days) it statistically ties DCC on one-step density forecasts and beats EWMA, Ledoit–Wolf, OAS, nonlinear shrinkage, RMT denoising, and the Gerber statistic — and it is the only method in the 90% model confidence set together with DCC. At n=300 it leads every competitor that remains statistically viable.
 
 ## Installation
 
 ```bash
-# From PyPI (once released)
-pip install squeeze-kernel
-pip install "squeeze-kernel[full]"
-
-# Directly from GitHub
-pip install "git+https://github.com/r0k3/squeeze-kernel.git"
-pip install "squeeze-kernel[full] @ git+https://github.com/r0k3/squeeze-kernel.git"
-
-# From a local clone
-pip install .
-pip install ".[full]"
+pip install squeeze-kernel          # NumPy only
+pip install "squeeze-kernel[full]"  # + SciPy (kappa calibration, chi² kernel)
 ```
 
-## Simple Usage
+## Quickstart
 
 ```python
 import numpy as np
-
 from squeeze_kernel import SqueezeKernelEstimator
 
-# Synthetic daily returns for 3 assets over 250 days
-rng = np.random.default_rng(42)
-returns = rng.normal(0.0, 0.01, size=(250, 3))
+# daily_returns: array of shape (T, n) — may contain NaN for missing assets
+est = SqueezeKernelEstimator(n_assets=daily_returns.shape[1])
 
-# Stream returns one day at a time
-est = SqueezeKernelEstimator(n_assets=3, kappa=1.5)
-for r_t in returns:
+for r_t in daily_returns:          # stream one day at a time
     est.update(r_t)
 
-# Get current estimates
-cov = est.get_cov()
-corr = est.get_corr()
-
-print(cov.shape)                  # (3, 3)
-print(corr.shape)                 # (3, 3)
-print(est.effective_sample_size)  # kernel-weighted sample size
-print(est.weight)                 # last kernel weight
+cov  = est.get_cov()               # (n, n) covariance, PSD by construction
+corr = est.get_corr()              # (n, n) correlation
 ```
 
-Missing observations can be passed as `np.nan`; the estimator handles them
-without breaking positive semi-definiteness.
+That is the whole API for most uses. The defaults (`lambda_vol=0.98`, `lambda_corr=0.996`, `kappa=0.25`) are the paper-recommended settings for daily returns, selected by time-series cross-validation and robust across a 50× parameter sweep — deploy them as-is.
 
-## Quick Start
-
-If you already have a returns matrix `daily_returns` with shape `(T, n_assets)`:
-
-```python
-from squeeze_kernel import SqueezeKernelEstimator
-
-est = SqueezeKernelEstimator(n_assets=50, kappa=0.25)
-for r_t in daily_returns:
-    est.update(r_t)
-
-cov = est.get_cov()
-corr = est.get_corr()
-```
-
-## Key Parameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `kappa` | 1.5 | Fisher kernel saturation used when `kernel_fn` is omitted |
-| `kernel_fn` | `None` | Optional alternative kernel function |
-| `kernel_kwargs` | `None` | Keyword arguments forwarded to `kernel_fn` |
-| `lambda_vol` | 0.94 | Volatility EWMA decay (half-life ≈ 12 days) |
-| `lambda_corr` | 0.99 | Correlation EWMA decay (half-life ≈ 69 days) |
-| `shrinkage` | `"auto"` | `"auto"`, `"none"`, or fixed float in [0, 1] |
-| `shrinkage_delta` | 0.10 | Threshold for adaptive shrinkage activation |
-
-## Calibrating κ from Data
-
-```python
-# Calibrate κ so the average kernel weight is ~0.6 on burn-in data
-kappa = SqueezeKernelEstimator.calibrate_kappa(
-    burn_in_returns, target_weight=0.6
-)
-est = SqueezeKernelEstimator(n_assets=50, kappa=kappa)
-```
-
-`calibrate_kappa()` and `kernel_chi2_cdf()` require SciPy. Install the `full`
-extra if you want those helpers.
-
-## Alternative Kernels
-
-The estimator defaults to the Fisher kernel. To use another built-in kernel,
-supply it explicitly with `kernel_fn` and pass its parameters via
-`kernel_kwargs`.
-
-```python
-from squeeze_kernel import SqueezeKernelEstimator, kernel_exponential
-
-est = SqueezeKernelEstimator(
-    n_assets=3,
-    kernel_fn=kernel_exponential,
-    kernel_kwargs={"gamma": 1.0},
-)
-```
-
-`gamma` is not an estimator argument; it belongs to the exponential kernel.
-
-## Batch Mode
+Batch mode, if you prefer the full path in one call:
 
 ```python
 from squeeze_kernel import estimate_squeeze_cov
 
-cov_tensor, corr_tensor, weights = estimate_squeeze_cov(
-    returns_matrix,  # shape (T, n)
-    kappa=0.25,
-    with_corr=True,
-    with_weights=True,
-)
+cov_path, corr_path, weights = estimate_squeeze_cov(daily_returns, with_weights=True)
+# cov_path: (T, n, n) — the estimate after each day
 ```
 
-## Examples
+A complete runnable walkthrough (streaming, missing data, batch) is in [`examples/quickstart.py`](examples/quickstart.py).
 
-The `examples/` directory contains end-to-end scripts:
+## Missing values
 
-- `quickstart.py` for a compact API walkthrough
-- `portfolio_voltarget.py` for a simple volatility-targeted portfolio backtest
+Pass `NaN` for any asset not observed on a given day — nothing else to do:
 
-## How It Works
+```python
+r_t = np.array([0.004, np.nan, -0.011])   # asset 2 not trading today
+est.update(r_t)                            # PSD preserved, no imputation
+```
 
-The estimator combines three components:
+## Parameters
 
-1. **Dual-timescale EWMA**: Fast volatility tracking (λ_vol) separated from slow correlation tracking (λ_corr)
-2. **Fisher kernel weighting**: w_t = d̄²_t / (d̄²_t + κ) filters uninformative calm-day observations
-3. **Adaptive equicorrelation shrinkage**: α_t = max(0, n/(2·S_t) − δ) automatically regularises when the effective sample size is small relative to dimension
+| Parameter | Default | Meaning |
+|---|---|---|
+| `lambda_vol` | `0.98` | volatility EWMA decay (half-life ≈ 34 days) |
+| `lambda_corr` | `0.996` | correlation EWMA decay (half-life ≈ 173 days, T_eff ≈ 250) |
+| `kappa` | `0.25` | Fisher kernel saturation; higher = stronger calm-day filtering |
+| `shrinkage` | `"auto"` | adaptive equicorrelation shrinkage (`"none"` or a float to override) |
+| `shrinkage_delta` | `0.10` | concentration threshold at which shrinkage activates |
 
-The complete update is a **natural gradient** step on the Gaussian log-likelihood (see paper, Appendix C).
+Useful read-only state after each `update()`: `est.weight` (last kernel weight), `est.effective_sample_size` (kernel-weighted T_eff), `est.shrinkage_intensity` (current α).
+
+To recalibrate `kappa` for a different asset class (requires the `full` extra):
+
+```python
+kappa = SqueezeKernelEstimator.calibrate_kappa(burn_in_returns, target_weight=0.6)
+```
+
+## Advanced options
+
+**Score-exact weighting** (`weight_statistic="mahalanobis"`, use with `kappa=1.0`): drives the kernel with the Mahalanobis surprise `z'C⁻¹z/N` against the estimator's own correlation instead of the marginal dispersion. Improves accuracy in the moderate-concentration regime — use only when `n / T_eff ≲ 0.5` (e.g. n ≤ 100 at the default `lambda_corr`); at higher concentration the estimated inverse degrades it and the default is strictly better.
+
+```python
+est = SqueezeKernelEstimator(n_assets=100, kappa=1.0, weight_statistic="mahalanobis")
+```
+
+**Score-driven memory** (`lambda_corr_fast=0.99`): lets stress days also *shorten* the correlation memory (decay slides from `lambda_corr` toward `lambda_corr_fast` as the kernel weight rises). Do **not** combine with the Mahalanobis option — they act on the same channel and the combination degrades accuracy.
+
+**Alternative kernels**: pass `kernel_fn=kernel_exponential` (with `kernel_kwargs={"gamma": ...}`) or `kernel_chi2_cdf`, or any callable `(d2, *, n_observed, **kw) -> float` mapping to `[0, 1)`. The PSD guarantee holds for any such kernel.
+
+## How it works
+
+Three mechanisms in one recursion:
+
+1. **Dual-timescale EWMA** — fast per-asset volatility (`lambda_vol`) is separated from slow correlation dynamics (`lambda_corr`), so variance shocks don't contaminate the correlation estimate.
+2. **Fisher kernel weighting** — each day's standardized outer product enters with weight `w = d²/(d² + kappa)`, where `d²` is the mean squared standardized return: calm days contribute little, dispersion shocks contribute fully.
+3. **Adaptive equicorrelation shrinkage** — `alpha = min(1, max(0, n/(2·S) − delta))` blends toward an equicorrelation target using the estimator's own kernel-weighted sample size `S`; it is a no-op at low dimension and provides provably bounded conditioning at high dimension.
+
+The complete update is a natural-gradient step on the Gaussian log-likelihood, with the kernel weight acting as an adaptive Riemannian learning rate (paper, Appendix B).
 
 ## Development
 
 ```bash
 uv sync --extra full --extra dev
-uv run python -m pytest
-uv run python -m ruff check .
-uv build
+uv run python -m pytest        # test suite
+uv run python -m ruff check .  # lint
+uv build                       # build sdist + wheel
 ```
+
+Releases: publishing a GitHub release from a `v*` tag triggers the [publish workflow](.github/workflows/publish.yml), which builds and uploads to PyPI via trusted publishing.
 
 ## Citation
 
 ```bibtex
 @article{kende2026squeeze,
-  title={The Squeeze Kernel Covariance Estimator: Dual-Timescale Tracking with Adaptive Shrinkage},
-  author={Kende, Robert},
-  year={2026}
+  title  = {The Squeeze Kernel Covariance Estimator: Dual-Timescale Tracking with Adaptive Shrinkage},
+  author = {Kende, Robert},
+  year   = {2026}
 }
 ```
+
+See also [`CITATION.cff`](CITATION.cff).
 
 ## License
 

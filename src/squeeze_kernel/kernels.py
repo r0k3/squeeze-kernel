@@ -90,7 +90,7 @@ def calibrate_kappa(d2_samples, target_mean_weight: float = 0.5) -> float:
 
 
 def extract_d2_series(
-    returns, lambda_vol: float = 0.94, epsilon: float = 1e-8,
+    returns, lambda_vol: float = 0.98, epsilon: float = 1e-8,
 ):
     """Extract the d̄²_t series from a returns panel for κ calibration.
 

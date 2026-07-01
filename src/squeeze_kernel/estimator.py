@@ -23,11 +23,17 @@ class SqueezeKernelEstimator:
     n_assets : int
         Number of assets.
     lambda_vol : float
-        Decay factor for per-asset volatility EWMA (default 0.94).
+        Decay factor for per-asset volatility EWMA (default 0.98,
+        half-life ≈ 34 trading days).
     lambda_corr : float
-        Decay factor for correlation EWMA (default 0.99).
+        Decay factor for correlation EWMA (default 0.996, half-life
+        ≈ 173 trading days, effective sample size ≈ 250).
     kappa : float, optional
-        Saturation parameter for the default Fisher kernel (default 1.5).
+        Saturation parameter for the default Fisher kernel (default 0.25).
+        The defaults for ``lambda_vol``, ``lambda_corr`` and ``kappa`` are
+        the values recommended in the paper for panels of daily financial
+        returns; they were selected by time-series cross-validation and are
+        insensitive to moderate perturbation.
     kernel_fn : callable, optional
         Custom kernel ``(d2, *, n_observed, **kw) -> float``.
         If omitted, the estimator uses ``kernel_fisher``.
@@ -73,7 +79,7 @@ class SqueezeKernelEstimator:
     --------
     >>> import numpy as np
     >>> returns = np.random.default_rng(42).normal(0.0, 0.01, size=(250, 3))
-    >>> est = SqueezeKernelEstimator(n_assets=3, kappa=1.5)
+    >>> est = SqueezeKernelEstimator(n_assets=3)
     >>> for r_t in returns:
     ...     est.update(r_t)
     >>> cov = est.get_cov()
@@ -84,8 +90,8 @@ class SqueezeKernelEstimator:
         self,
         n_assets: int,
         *,
-        lambda_vol: float = 0.94,
-        lambda_corr: float = 0.99,
+        lambda_vol: float = 0.98,
+        lambda_corr: float = 0.996,
         kappa: float | None = None,
         kernel_fn: KernelFn | None = None,
         kernel_kwargs: dict[str, object] | None = None,
@@ -255,7 +261,7 @@ class SqueezeKernelEstimator:
 
     @staticmethod
     def calibrate_kappa(
-        returns, target_weight: float = 0.5, lambda_vol: float = 0.94,
+        returns, target_weight: float = 0.5, lambda_vol: float = 0.98,
     ) -> float:
         """Calibrate κ from burn-in data so E[w_t] ≈ target_weight.
 
@@ -367,7 +373,7 @@ def _resolve_kernel(
     if "kappa" in kw and kappa is not None:
         raise ValueError("Pass kappa either as a top-level argument or in kernel_kwargs, not both.")
 
-    resolved_kappa = float(kw.get("kappa", 1.5 if kappa is None else kappa))
+    resolved_kappa = float(kw.get("kappa", 0.25 if kappa is None else kappa))
     if resolved_kappa <= 0.0:
         raise ValueError("kappa must be > 0.")
     kw["kappa"] = resolved_kappa

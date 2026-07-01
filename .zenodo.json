@@ -1,8 +1,0 @@
-{
-  "title": "squeeze-cov: Squeeze Kernel Covariance Estimator",
-  "description": "Python implementation of the Squeeze Kernel covariance estimator (dual-timescale EWMA + Fisher kernel + adaptive shrinkage) from the paper 'The Squeeze Kernel Covariance Estimator' by Robert Kende.",
-  "creators": [{"name": "Robert Kende"}],
-  "upload_type": "software",
-  "license": "MIT",
-  "keywords": ["covariance", "ewma", "gerber", "portfolio", "risk-management"]
-}

@@ -11,8 +11,8 @@ from squeeze_kernel.kernels import KernelFn
 def estimate_squeeze_cov(
     returns,
     *,
-    lambda_vol: float = 0.94,
-    lambda_corr: float = 0.99,
+    lambda_vol: float = 0.98,
+    lambda_corr: float = 0.996,
     kappa: float | None = None,
     kernel_fn: KernelFn | None = None,
     kernel_kwargs: dict[str, object] | None = None,
