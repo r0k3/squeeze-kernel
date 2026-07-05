@@ -337,3 +337,39 @@ class TestExtensions:
             SqueezeKernelEstimator(3, vol_anchor_phi=0.0)
         with pytest.raises(ValueError):
             SqueezeKernelEstimator(3, vol_anchor_decay=1.0)
+
+    def test_cluster_target_defaults_unchanged(self, rng):
+        """shrinkage_target default reproduces the base estimator bit-for-bit."""
+        x = rng.normal(0, 0.01, size=(400, 5))
+        base = self._run(SqueezeKernelEstimator(5, kappa=1.0), x)
+        eq = self._run(SqueezeKernelEstimator(5, kappa=1.0, shrinkage_target="equicorrelation"), x)
+        assert np.array_equal(base, eq)
+
+    def test_cluster_target_identity_when_alpha_zero(self, rng):
+        """With n << T_eff the shrinkage never activates, so the cluster target
+        must be exactly the base estimator (the alpha -> 0 reduction)."""
+        x = rng.normal(0, 0.01, size=(600, 3))     # n=3, T_eff=100 -> alpha=0
+        base = self._run(SqueezeKernelEstimator(3, kappa=1.0, lambda_corr=0.99), x)
+        cl = self._run(SqueezeKernelEstimator(3, kappa=1.0, lambda_corr=0.99,
+                                              shrinkage_target="cluster"), x)
+        assert np.allclose(base, cl)
+
+    def test_cluster_target_psd_and_divergence_high_concentration(self, rng):
+        """At n comparable to T_eff the cluster target activates: PSD every
+        step and different from the equicorrelation blend."""
+        # n=25 with lambda_corr=0.98 (T_eff=50) -> alpha = 25/(2*~40)-0.1 > 0
+        common = rng.normal(0, 0.01, size=(400, 1))
+        x = 0.7 * common + rng.normal(0, 0.008, size=(400, 25))
+        est_c = SqueezeKernelEstimator(25, kappa=1.0, lambda_corr=0.98,
+                                       shrinkage_target="cluster")
+        est_e = SqueezeKernelEstimator(25, kappa=1.0, lambda_corr=0.98)
+        for t in range(400):
+            est_c.update(x[t])
+            est_e.update(x[t])
+            assert np.linalg.eigvalsh(est_c.get_cov()).min() >= -1e-12
+        assert est_c.shrinkage_intensity > 0.0
+        assert not np.allclose(est_c.get_cov(), est_e.get_cov())
+
+    def test_cluster_target_invalid_raises(self):
+        with pytest.raises(ValueError):
+            SqueezeKernelEstimator(3, shrinkage_target="blocks")

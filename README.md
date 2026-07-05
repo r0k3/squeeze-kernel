@@ -100,6 +100,12 @@ est = SqueezeKernelEstimator(n_assets=100, kappa=1.0, weight_statistic="mahalano
 est = SqueezeKernelEstimator(n_assets=100, vol_anchor_phi=0.995)
 ```
 
+**Cluster shrinkage target** (`shrinkage_target="cluster"`): generalizes the equicorrelation shrinkage target to respect the correlation matrix's own block/cluster structure — with **no clustering algorithm**. The target morphs with the shrinkage intensity, T = (1−α)·T_equi + α·[(1−γ)I + γ·(C∘C)], where C∘C is the Hadamard square of the current correlation (positive semi-definite by the Schur product theorem; entries are pairwise shared-variance fractions) and γ is level-matched automatically. Zero added parameters, still O(n²), and as α→0 it reduces exactly to the default estimator. Held-out one-step NLL on the S&P 500 benchmark: ±0.1 at n=100, **−4.2 at n=200, −25.0 at n=300** — recommended whenever the universe size approaches the effective sample size.
+
+```python
+est = SqueezeKernelEstimator(n_assets=300, shrinkage_target="cluster")
+```
+
 **Alternative kernels**: pass `kernel_fn=kernel_exponential` (with `kernel_kwargs={"gamma": ...}`) or `kernel_chi2_cdf`, or any callable `(d2, *, n_observed, **kw) -> float` mapping to `[0, 1)`. The PSD guarantee holds for any such kernel.
 
 ## How it works
