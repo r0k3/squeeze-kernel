@@ -7,7 +7,7 @@
 
 A **streaming covariance estimator for panels of daily financial returns**. One `O(n²)` update per day, positive semi-definite **by construction** at every step, missing values handled **natively**, and defaults that require no tuning. Only dependency: NumPy.
 
-Reference: *"The Squeeze Kernel Covariance Estimator: Dual-Timescale Tracking with Adaptive Shrinkage"* (Kende, 2026).
+Reference: *"The Squeeze Kernel Covariance Estimator: Dual-Timescale Tracking with Adaptive Shrinkage"* (Kende, 2026) — [SSRN abstract 6455918](https://ssrn.com/abstract=6455918).
 
 ## Why
 
@@ -135,7 +135,8 @@ Releases: publishing a GitHub release from a `v*` tag triggers the [publish work
 @article{kende2026squeeze,
   title  = {The Squeeze Kernel Covariance Estimator: Dual-Timescale Tracking with Adaptive Shrinkage},
   author = {Kende, Robert},
-  year   = {2026}
+  year   = {2026},
+  note   = {Available at SSRN: \url{https://ssrn.com/abstract=6455918}}
 }
 ```
 
