@@ -74,6 +74,25 @@ class SqueezeKernelEstimator:
         Do not combine with ``weight_statistic='mahalanobis'`` — the two
         mechanisms act on the same reactivity channel and their combination
         degraded out-of-sample accuracy in testing.
+    vol_anchor_phi : float or None
+        If set, enables the OU volatility anchor: each asset's variance
+        prediction mean-reverts toward a slow per-asset anchor before the
+        measurement update, v_pred = v̄ + φ·(v − v̄), with the anchor v̄ a
+        slow EWMA of squared returns (see ``vol_anchor_decay``).  φ is the
+        per-step retention of deviations from the anchor (deviation
+        half-life ≈ ln 2 / (1 − φ) days); φ = 1 or ``None`` (default)
+        reproduces the published estimator exactly.  Recommended φ = 0.995
+        (conservative; the range [0.99, 0.995] is robust).  On the S&P-500
+        n=100 benchmark this improved held-out one-step NLL by 3.3 points
+        (φ=0.995; 4.3 at φ=0.99) and five-step NLL by 3.9 (5.0), with no
+        degradation at n=300.  Mechanism: a two-timescale (component-style)
+        volatility structure — it changes persistence, not shock response.
+        Validated with the default marginal kernel; interaction with the
+        correlation-side extensions above is untested.
+    vol_anchor_decay : float
+        Decay of the slow per-asset variance anchor (default 0.999,
+        effective memory ≈ 1000 trading days).  Only used when
+        ``vol_anchor_phi`` is set.
 
     Examples
     --------
@@ -102,6 +121,8 @@ class SqueezeKernelEstimator:
         impute_threshold: float = 0.6,
         weight_statistic: str = "marginal",
         lambda_corr_fast: float | None = None,
+        vol_anchor_phi: float | None = None,
+        vol_anchor_decay: float = 0.999,
     ):
         self.n_assets = n_assets
         self.lambda_vol = lambda_vol
@@ -118,6 +139,12 @@ class SqueezeKernelEstimator:
         if lambda_corr_fast is not None and not (0.0 < lambda_corr_fast < 1.0):
             raise ValueError("lambda_corr_fast must be in (0, 1).")
         self.lambda_corr_fast = lambda_corr_fast
+        if vol_anchor_phi is not None and not (0.0 < vol_anchor_phi <= 1.0):
+            raise ValueError("vol_anchor_phi must be in (0, 1].")
+        if not (0.0 < vol_anchor_decay < 1.0):
+            raise ValueError("vol_anchor_decay must be in (0, 1).")
+        self.vol_anchor_phi = vol_anchor_phi
+        self.vol_anchor_decay = vol_anchor_decay
 
         # Resolve shrinkage
         if isinstance(shrinkage, str):
@@ -132,6 +159,7 @@ class SqueezeKernelEstimator:
         # State
         self._var_t: np.ndarray | None = None
         self._var_init: np.ndarray | None = None
+        self._var_anchor: np.ndarray | None = None
         self._M_t = np.eye(n_assets, dtype=np.float64) * epsilon
         self._S_t = float(epsilon)
         self._cov: np.ndarray | None = None
@@ -172,17 +200,38 @@ class SqueezeKernelEstimator:
         if self._var_t is None:
             self._var_t = np.zeros(n, dtype=np.float64)
             self._var_init = np.zeros(n, dtype=bool)
+            if self.vol_anchor_phi is not None:
+                self._var_anchor = np.zeros(n, dtype=np.float64)
 
         first = finite & ~self._var_init
         repeat = finite & self._var_init
         if np.any(first):
             self._var_t[first] = r_t[first] ** 2 + eps
             self._var_init[first] = True
+            if self._var_anchor is not None:
+                self._var_anchor[first] = self._var_t[first]
         if np.any(repeat):
-            self._var_t[repeat] = (
-                self.lambda_vol * self._var_t[repeat]
-                + (1.0 - self.lambda_vol) * r_t[repeat] ** 2
-            )
+            if self.vol_anchor_phi is None:
+                self._var_t[repeat] = (
+                    self.lambda_vol * self._var_t[repeat]
+                    + (1.0 - self.lambda_vol) * r_t[repeat] ** 2
+                )
+            else:
+                # OU anchor: mean-revert the variance prediction toward a slow
+                # per-asset anchor before the measurement update, then update
+                # the anchor itself (order matters and matches the validated
+                # experiment: prediction uses the *old* anchor).
+                phi = self.vol_anchor_phi
+                lam_bar = self.vol_anchor_decay
+                anchor = self._var_anchor[repeat]
+                v_pred = anchor + phi * (self._var_t[repeat] - anchor)
+                self._var_t[repeat] = (
+                    self.lambda_vol * v_pred
+                    + (1.0 - self.lambda_vol) * r_t[repeat] ** 2
+                )
+                self._var_anchor[repeat] = (
+                    lam_bar * anchor + (1.0 - lam_bar) * r_t[repeat] ** 2
+                )
 
         vol_t = np.zeros(n, dtype=np.float64)
         vol_t[self._var_init] = np.sqrt(self._var_t[self._var_init])

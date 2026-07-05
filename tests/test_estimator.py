@@ -284,3 +284,56 @@ class TestExtensions:
             w = est.update(x[t])
             assert 0.0 <= w < 1.0
         assert np.isfinite(est.get_cov()).all()
+
+    def test_vol_anchor_off_is_identity(self, rng):
+        """vol_anchor_phi=None and phi=1.0 must both reproduce the base estimator."""
+        x = rng.normal(0, 0.01, size=(400, 5))
+        base = self._run(SqueezeKernelEstimator(5, kappa=1.0), x)
+        off = self._run(SqueezeKernelEstimator(5, kappa=1.0, vol_anchor_phi=None), x)
+        phi1 = self._run(SqueezeKernelEstimator(5, kappa=1.0, vol_anchor_phi=1.0), x)
+        assert np.array_equal(base, off)
+        assert np.allclose(base, phi1)
+
+    def test_vol_anchor_psd_and_divergence(self, rng):
+        """Anchored variant stays PSD every step and differs from base."""
+        x = rng.normal(0, 0.01, size=(500, 6))
+        x[200:260] *= 3.0  # a vol regime so the anchor has something to do
+        est_a = SqueezeKernelEstimator(6, kappa=1.0, vol_anchor_phi=0.995)
+        est_b = SqueezeKernelEstimator(6, kappa=1.0)
+        for t in range(500):
+            est_a.update(x[t])
+            est_b.update(x[t])
+            assert np.linalg.eigvalsh(est_a.get_cov()).min() >= -1e-12
+        assert not np.allclose(est_a.get_cov(), est_b.get_cov())
+
+    def test_vol_anchor_pulls_toward_longrun(self, rng):
+        """After a transient vol spike, the anchored variance sits closer to the
+        long-run level than the plain EWMA variance does."""
+        calm = rng.normal(0, 0.01, size=(600, 3))
+        calm[500:520] *= 6.0  # spike, then calm again
+        est_a = SqueezeKernelEstimator(3, kappa=1.0, vol_anchor_phi=0.99)
+        est_b = SqueezeKernelEstimator(3, kappa=1.0)
+        for t in range(530):   # ten days after the spike ends
+            est_a.update(calm[t])
+            est_b.update(calm[t])
+        long_run = (0.01) ** 2
+        va = np.diag(est_a.get_cov())
+        vb = np.diag(est_b.get_cov())
+        assert np.all(np.abs(va - long_run) <= np.abs(vb - long_run) + 1e-12)
+
+    def test_vol_anchor_with_missing_data(self, rng):
+        x = rng.normal(0, 0.01, size=(300, 5))
+        x[50::7, 2] = np.nan
+        est = SqueezeKernelEstimator(5, kappa=1.0, vol_anchor_phi=0.995)
+        for t in range(300):
+            w = est.update(x[t])
+            assert 0.0 <= w < 1.0
+        assert np.isfinite(est.get_cov()).all()
+
+    def test_vol_anchor_invalid_raises(self):
+        with pytest.raises(ValueError):
+            SqueezeKernelEstimator(3, vol_anchor_phi=1.5)
+        with pytest.raises(ValueError):
+            SqueezeKernelEstimator(3, vol_anchor_phi=0.0)
+        with pytest.raises(ValueError):
+            SqueezeKernelEstimator(3, vol_anchor_decay=1.0)

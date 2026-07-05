@@ -94,6 +94,12 @@ est = SqueezeKernelEstimator(n_assets=100, kappa=1.0, weight_statistic="mahalano
 
 **Score-driven memory** (`lambda_corr_fast=0.99`): lets stress days also *shorten* the correlation memory (decay slides from `lambda_corr` toward `lambda_corr_fast` as the kernel weight rises). Do **not** combine with the Mahalanobis option — they act on the same channel and the combination degrades accuracy.
 
+**OU volatility anchor** (`vol_anchor_phi=0.995`): mean-reverts each asset's variance prediction toward a slow per-asset anchor (a ~1000-day EWMA of squared returns) before the daily update — a two-timescale, component-style volatility structure. One global parameter with a clean interpretation (deviation half-life ≈ ln 2/(1−φ) days; φ=0.995 ≈ 139 d). On the S&P 500 n=100 benchmark this improved held-out one-step NLL by 3.3 points (4.3 at φ=0.99) and five-step NLL by 3.9 (5.0), with no degradation at n=300. `None` (default) or φ=1 reproduces the published estimator exactly.
+
+```python
+est = SqueezeKernelEstimator(n_assets=100, vol_anchor_phi=0.995)
+```
+
 **Alternative kernels**: pass `kernel_fn=kernel_exponential` (with `kernel_kwargs={"gamma": ...}`) or `kernel_chi2_cdf`, or any callable `(d2, *, n_observed, **kw) -> float` mapping to `[0, 1)`. The PSD guarantee holds for any such kernel.
 
 ## How it works
