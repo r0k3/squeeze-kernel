@@ -86,6 +86,14 @@ kappa = SqueezeKernelEstimator.calibrate_kappa(burn_in_returns, target_weight=0.
 
 ## Advanced options
 
+**Scale-free correlation memory** (`corr_half_lives=(43, 173, 693)`, `corr_theta=0.25`): replaces the single correlation timescale with a positive combination of EWMAs on a geometric half-life ladder — each scale normalized and adaptively shrunk against its own effective sample size, then the covariances blended with weights ∝ half-life^`corr_theta`. By Bernstein's theorem this approximates the power-law memory of financial correlations (the streaming analogue of HAR); positive weights keep it PSD by construction, and `None` (default) reproduces the published single-scale estimator exactly. This is the paper's **headline configuration**: on the S&P 500 benchmark it leads every tested method at every universe size (held-out one-step NLL −3.9 at n=100, up to −18 at n=300 before the cluster target), and the 90% model confidence set collapses to it alone. Cost is O(K·n²) per update. Composes with `shrinkage_target="cluster"`; mutually exclusive with `lambda_corr_fast`.
+
+```python
+est = SqueezeKernelEstimator(n_assets=100, corr_half_lives=(43, 173, 693), corr_theta=0.25)
+# maximal variant at high dimension:
+est = SqueezeKernelEstimator(n_assets=300, corr_half_lives=(43, 173, 693), shrinkage_target="cluster")
+```
+
 **Score-exact weighting** (`weight_statistic="mahalanobis"`, use with `kappa=1.0`): drives the kernel with the Mahalanobis surprise `z'C⁻¹z/N` against the estimator's own correlation instead of the marginal dispersion. Improves accuracy in the moderate-concentration regime — use only when `n / T_eff ≲ 0.5` (e.g. n ≤ 100 at the default `lambda_corr`); at higher concentration the estimated inverse degrades it and the default is strictly better.
 
 ```python
