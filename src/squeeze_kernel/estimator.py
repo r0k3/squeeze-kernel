@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import numpy as np
 
 from squeeze_kernel.kernels import (
     KernelFn, kernel_fisher, calibrate_kappa, extract_d2_series,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 
 class SqueezeKernelEstimator:
@@ -107,6 +112,28 @@ class SqueezeKernelEstimator:
         concentration is unchanged.  Held-out one-step NLL on the S&P-500
         benchmark: +0.14 (negligible) at n=100, −4.2 at n=200, −25.0 at
         n=300.  Recommended when n approaches the effective sample size.
+    corr_half_lives : sequence of float, optional
+        Scale-free correlation memory.  When set, the single correlation
+        timescale is replaced by a positive combination of EWMAs on the
+        given geometric half-life ladder (in trading days, e.g.
+        ``(43, 173, 693)``): each scale is normalised and adaptively
+        shrunk against its own effective sample size, and the resulting
+        covariances are blended with weights ∝ half-life\\ :sup:`corr_theta`.
+        By Bernstein's theorem this approximates the power-law memory of
+        financial correlations (the streaming analogue of HAR).  PSD by
+        construction (positive combination of PSD matrices).  ``None``
+        (default) is the published single-scale estimator, bit-for-bit;
+        a one-element ladder reduces to a single-scale estimator at that
+        half-life.  Mutually exclusive with ``lambda_corr_fast``; composes
+        with ``shrinkage_target='cluster'``.  Cost is O(K·n²) per update.
+        Held-out one-step NLL on the S&P-500 benchmark improves at every
+        dimension (−3.9 at n=100, up to −18 at n=300 before the cluster
+        target); the $90\\%$ model confidence set collapses to this
+        configuration alone.  Recommended default: the base-centred ladder
+        ``(43, 173, 693)`` with ``corr_theta=0.25``.
+    corr_theta : float
+        Long-memory exponent controlling the ladder weights (default
+        0.25).  Only used when ``corr_half_lives`` is set.
 
     Examples
     --------
@@ -138,6 +165,8 @@ class SqueezeKernelEstimator:
         vol_anchor_phi: float | None = None,
         vol_anchor_decay: float = 0.999,
         shrinkage_target: str = "equicorrelation",
+        corr_half_lives: "Sequence[float] | None" = None,
+        corr_theta: float = 0.25,
     ):
         self.n_assets = n_assets
         self.lambda_vol = lambda_vol
@@ -163,6 +192,34 @@ class SqueezeKernelEstimator:
         if shrinkage_target not in ("equicorrelation", "cluster"):
             raise ValueError("shrinkage_target must be 'equicorrelation' or 'cluster'.")
         self.shrinkage_target = shrinkage_target
+
+        # Scale-free correlation memory (opt-in): replace the single correlation
+        # timescale by a positive combination of EWMAs on a geometric half-life
+        # ladder, blended per-scale (Mode A). None => single-scale, published
+        # behaviour bit-for-bit. See ``corr_half_lives`` in the class docstring.
+        self.corr_half_lives = None
+        self.corr_theta = corr_theta
+        self._corr_lam: np.ndarray | None = None
+        self._corr_w: np.ndarray | None = None
+        self._M_list: list[np.ndarray] | None = None
+        self._S_list: list[float] | None = None
+        if corr_half_lives is not None:
+            hl = np.asarray(corr_half_lives, dtype=np.float64)
+            if hl.ndim != 1 or hl.size < 1 or np.any(hl <= 0.0):
+                raise ValueError("corr_half_lives must be a non-empty sequence of positive half-lives.")
+            if corr_theta < 0.0:
+                raise ValueError("corr_theta must be >= 0.")
+            if lambda_corr_fast is not None:
+                raise ValueError(
+                    "corr_half_lives and lambda_corr_fast are mutually exclusive "
+                    "correlation-memory mechanisms; set at most one."
+                )
+            self.corr_half_lives = hl
+            self._corr_lam = 2.0 ** (-1.0 / hl)
+            w = hl ** corr_theta
+            self._corr_w = w / w.sum()
+            self._M_list = [np.eye(n_assets, dtype=np.float64) * epsilon for _ in hl]
+            self._S_list = [float(epsilon) for _ in hl]
 
         # Resolve shrinkage
         if isinstance(shrinkage, str):
@@ -277,22 +334,45 @@ class SqueezeKernelEstimator:
         if self.impute_missing and 0 < n_obs < n:
             self._impute(z_t, finite)
 
-        # ── Correlation EWMA (in-place to avoid per-step allocations) ──
-        lam_c = self.lambda_corr
-        if self.lambda_corr_fast is not None:
-            # Score-driven memory: stress days (w_t → 1) shorten the memory
-            # toward lambda_corr_fast; calm days keep the slow decay.
-            lam_c = self.lambda_corr + (self.lambda_corr_fast - self.lambda_corr) * w_t
-        self._S_t = lam_c * self._S_t + w_t
-        self._M_t *= lam_c
-        if w_t > 0.0 and n_obs > 0:
-            # np.multiply.outer with out= avoids the temporary that
-            # np.outer otherwise allocates each step.
-            np.multiply.outer(z_t, z_t, out=self._scratch_outer)
-            self._M_t += w_t * self._scratch_outer
-
-        # ── Extract covariance ──
-        self._cov, self._corr = self._extract(vol_t)
+        if self._corr_lam is None:
+            # ── Single-scale correlation EWMA (published path, unchanged) ──
+            lam_c = self.lambda_corr
+            if self.lambda_corr_fast is not None:
+                # Score-driven memory: stress days (w_t → 1) shorten the memory
+                # toward lambda_corr_fast; calm days keep the slow decay.
+                lam_c = self.lambda_corr + (self.lambda_corr_fast - self.lambda_corr) * w_t
+            self._S_t = lam_c * self._S_t + w_t
+            self._M_t *= lam_c
+            if w_t > 0.0 and n_obs > 0:
+                # np.multiply.outer with out= avoids the temporary that
+                # np.outer otherwise allocates each step.
+                np.multiply.outer(z_t, z_t, out=self._scratch_outer)
+                self._M_t += w_t * self._scratch_outer
+            self._cov, self._corr = self._extract(vol_t)
+        else:
+            # ── Scale-free ladder (Mode A) ──
+            # Update K correlation accumulators on the geometric half-life
+            # ladder; normalise and adaptively shrink each against its OWN
+            # effective sample size, then blend the per-scale covariances.
+            add = w_t > 0.0 and n_obs > 0
+            if add:
+                np.multiply.outer(z_t, z_t, out=self._scratch_outer)
+            cov = np.zeros((n, n), dtype=np.float64)
+            s_eff = 0.0
+            for k in range(self._corr_lam.size):
+                self._S_list[k] = self._corr_lam[k] * self._S_list[k] + w_t
+                self._M_list[k] *= self._corr_lam[k]
+                if add:
+                    self._M_list[k] += w_t * self._scratch_outer
+                cov_k, _ = self._extract(vol_t, self._M_list[k], self._S_list[k])
+                cov += self._corr_w[k] * cov_k
+                s_eff += self._corr_w[k] * self._S_list[k]
+            cov = 0.5 * (cov + cov.T)
+            self._cov = cov
+            self._S_t = s_eff                        # blended effective size (for the property)
+            d = np.sqrt(np.maximum(np.diagonal(cov), eps))
+            self._corr = cov / np.outer(d, d)
+            np.fill_diagonal(self._corr, 1.0)
         self._last_weight = w_t
         return w_t
 
@@ -373,22 +453,23 @@ class SqueezeKernelEstimator:
             if den > 0.0:
                 z_t[i] = num / den
 
-    def _extract(self, vol_t: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def _extract(self, vol_t: np.ndarray, M_t=None, S_in=None) -> tuple[np.ndarray, np.ndarray]:
         eps = self.epsilon
-        S_t = max(self._S_t, eps)
+        M_t = self._M_t if M_t is None else M_t
+        S_t = max(self._S_t if S_in is None else S_in, eps)
         n = self.n_assets
 
         # Normalised standardised covariance matrix sigma_z = M_t / S_t.
         # Compute correlations directly into the cached scratch buffer to
         # avoid two intermediate allocations (sigma_z and corr).
-        diag_z = np.diagonal(self._M_t).copy()
+        diag_z = np.diagonal(M_t).copy()
         diag_z /= S_t                                # in-place
         inv_diag = 1.0 / np.sqrt(np.maximum(diag_z, eps))
         # corr_ij = (M_ij / S_t) * inv_diag_i * inv_diag_j; this writes
         # the rescaled outer-product into _scratch_corr in one pass.
         np.multiply.outer(inv_diag, inv_diag, out=self._scratch_corr)
         corr = self._scratch_corr
-        corr *= self._M_t                            # in-place; corr = sigma_z * outer(inv_diag,inv_diag)
+        corr *= M_t                                  # in-place; corr = sigma_z * outer(inv_diag,inv_diag)
         corr *= (1.0 / S_t)                          # absorb the M_t / S_t scale
         np.fill_diagonal(corr, np.where(diag_z > eps, 1.0, 0.0))
 
