@@ -201,7 +201,7 @@ class SqueezeKernelEstimator:
         self.corr_theta = corr_theta
         self._corr_lam: np.ndarray | None = None
         self._corr_w: np.ndarray | None = None
-        self._M_list: list[np.ndarray] | None = None
+        self._Q_list: list[np.ndarray] | None = None
         self._S_list: list[float] | None = None
         if corr_half_lives is not None:
             hl = np.asarray(corr_half_lives, dtype=np.float64)
@@ -218,7 +218,7 @@ class SqueezeKernelEstimator:
             self._corr_lam = 2.0 ** (-1.0 / hl)
             w = hl ** corr_theta
             self._corr_w = w / w.sum()
-            self._M_list = [np.eye(n_assets, dtype=np.float64) * epsilon for _ in hl]
+            self._Q_list = [np.eye(n_assets, dtype=np.float64) for _ in hl]
             self._S_list = [float(epsilon) for _ in hl]
 
         # Resolve shrinkage
@@ -231,21 +231,33 @@ class SqueezeKernelEstimator:
         self._kernel_fn, self._kernel_kwargs = _resolve_kernel(kappa, kernel_fn, kernel_kwargs)
         self.kappa = self._kernel_kwargs.get("kappa") if self._kernel_fn is kernel_fisher else None
 
-        # State
+        # State. The correlation memory is stored NORMALISED: Q_t = M_t / S_t
+        # with the recursion Q_t = (1 - eta_t) Q_{t-1} + eta_t z_t z_t',
+        # eta_t = w_t / S_t after S_t <- lam S_{t-1} + w_t. This is
+        # algebraically identical to the raw-mass form (M init eps*I, S init
+        # eps => Q init I), keeps the matrix state well scaled, and makes the
+        # PSD convex-combination recursion explicit.
         self._var_t: np.ndarray | None = None
         self._var_init: np.ndarray | None = None
         self._var_anchor: np.ndarray | None = None
-        self._M_t = np.eye(n_assets, dtype=np.float64) * epsilon
+        self._vol_t: np.ndarray | None = None
+        # No single-scale state is allocated in ladder mode.
+        self._Q_t = (np.eye(n_assets, dtype=np.float64)
+                     if self._corr_lam is None else None)
         self._S_t = float(epsilon)
         self._cov: np.ndarray | None = None
         self._corr: np.ndarray | None = None
         self._last_weight: float = 0.0
+        # Extraction (normalise + shrink + vol application) is deferred until
+        # get_cov()/get_corr(); _dirty marks state newer than _cov/_corr.
+        self._dirty = False
 
         # Cached scratch buffers reused per ``update()`` to avoid per-step
         # allocator churn. These are intentionally module-private and
         # never escape the estimator.
         self._scratch_outer = np.empty((n_assets, n_assets), dtype=np.float64)
         self._scratch_corr = np.empty((n_assets, n_assets), dtype=np.float64)
+        self._scratch_had = np.empty((n_assets, n_assets), dtype=np.float64)
         self._n_off = float(n_assets * (n_assets - 1)) if n_assets > 1 else 1.0
 
     # ── Public API ────────────────────────────────────────────────────────
@@ -317,10 +329,13 @@ class SqueezeKernelEstimator:
         if n_obs > 0:
             z_t[finite] = r_t[finite] / (vol_t[finite] + eps)
             d2 = float(z_t[finite] @ z_t[finite]) / n_obs
-            if self.weight_statistic == "mahalanobis" and self._corr is not None:
+            if self.weight_statistic == "mahalanobis" and self._vol_t is not None:
                 # Score-exact surprise against the estimator's own previous
                 # correlation; falls back to the marginal d² on the first
-                # step or a (rare) singular observed submatrix.
+                # step or a (rare) singular observed submatrix. Extraction is
+                # lazy, so bring _corr up to the t-1 state first.
+                if self._dirty:
+                    self._materialize()
                 try:
                     c_sub = self._corr[np.ix_(finite, finite)]
                     d2 = float(z_t[finite] @ np.linalg.solve(c_sub, z_t[finite])) / n_obs
@@ -334,58 +349,61 @@ class SqueezeKernelEstimator:
         if self.impute_missing and 0 < n_obs < n:
             self._impute(z_t, finite)
 
+        add = w_t > 0.0 and n_obs > 0
+        if add:
+            # np.multiply.outer with out= avoids the temporary that
+            # np.outer otherwise allocates each step. zz' is computed once
+            # and shared by every rung.
+            np.multiply.outer(z_t, z_t, out=self._scratch_outer)
         if self._corr_lam is None:
-            # ── Single-scale correlation EWMA (published path, unchanged) ──
+            # ── Single-scale correlation EWMA (published path) ──
             lam_c = self.lambda_corr
             if self.lambda_corr_fast is not None:
                 # Score-driven memory: stress days (w_t → 1) shorten the memory
                 # toward lambda_corr_fast; calm days keep the slow decay.
                 lam_c = self.lambda_corr + (self.lambda_corr_fast - self.lambda_corr) * w_t
             self._S_t = lam_c * self._S_t + w_t
-            self._M_t *= lam_c
-            if w_t > 0.0 and n_obs > 0:
-                # np.multiply.outer with out= avoids the temporary that
-                # np.outer otherwise allocates each step.
-                np.multiply.outer(z_t, z_t, out=self._scratch_outer)
-                self._M_t += w_t * self._scratch_outer
-            self._cov, self._corr = self._extract(vol_t)
+            if add:
+                # Q <- (1 - eta) Q + eta zz'. With w_t = 0 both S and M decay
+                # by lam_c, so Q is unchanged — no matrix work at all.
+                eta = w_t / self._S_t
+                self._Q_t *= 1.0 - eta
+                self._scratch_outer *= eta
+                self._Q_t += self._scratch_outer
         else:
             # ── Scale-free ladder (Mode A) ──
-            # Update K correlation accumulators on the geometric half-life
-            # ladder; normalise and adaptively shrink each against its OWN
-            # effective sample size, then blend the per-scale covariances.
-            add = w_t > 0.0 and n_obs > 0
-            if add:
-                np.multiply.outer(z_t, z_t, out=self._scratch_outer)
-            cov = np.zeros((n, n), dtype=np.float64)
+            # Update K normalised correlation states on the geometric
+            # half-life ladder; extraction (normalise + shrink + blend)
+            # happens lazily in _materialize().
             s_eff = 0.0
             for k in range(self._corr_lam.size):
                 self._S_list[k] = self._corr_lam[k] * self._S_list[k] + w_t
-                self._M_list[k] *= self._corr_lam[k]
                 if add:
-                    self._M_list[k] += w_t * self._scratch_outer
-                cov_k, _ = self._extract(vol_t, self._M_list[k], self._S_list[k])
-                cov += self._corr_w[k] * cov_k
+                    eta = w_t / self._S_list[k]
+                    self._Q_list[k] *= 1.0 - eta
+                    np.multiply(self._scratch_outer, eta, out=self._scratch_had)
+                    self._Q_list[k] += self._scratch_had
                 s_eff += self._corr_w[k] * self._S_list[k]
-            cov = 0.5 * (cov + cov.T)
-            self._cov = cov
             self._S_t = s_eff                        # blended effective size (for the property)
-            d = np.sqrt(np.maximum(np.diagonal(cov), eps))
-            self._corr = cov / np.outer(d, d)
-            np.fill_diagonal(self._corr, 1.0)
+        self._vol_t = vol_t
+        self._dirty = True
         self._last_weight = w_t
         return w_t
 
     def get_cov(self) -> np.ndarray:
         """Return the current covariance matrix estimate (n x n)."""
-        if self._cov is None:
+        if self._vol_t is None:
             raise RuntimeError("Call update() at least once before get_cov().")
+        if self._dirty:
+            self._materialize()
         return self._cov.copy()
 
     def get_corr(self) -> np.ndarray:
         """Return the current correlation matrix estimate (n x n)."""
-        if self._corr is None:
+        if self._vol_t is None:
             raise RuntimeError("Call update() at least once before get_corr().")
+        if self._dirty:
+            self._materialize()
         return self._corr.copy()
 
     @property
@@ -432,9 +450,13 @@ class SqueezeKernelEstimator:
     # ── Private helpers ───────────────────────────────────────────────────
 
     def _impute(self, z_t: np.ndarray, finite: np.ndarray) -> None:
+        if self._Q_t is None:
+            # Ladder mode: imputation reads the single-scale state, which
+            # was never updated on this path — historically a silent no-op
+            # (all correlations below threshold); keep it an explicit one.
+            return
         eps = self.epsilon
-        denom = max(self._S_t, eps)
-        sigma_z = self._M_t / denom
+        sigma_z = self._Q_t
         diag_z = np.diag(sigma_z)
         inv_diag = 1.0 / np.sqrt(np.maximum(diag_z, eps))
         missing = ~finite
@@ -453,24 +475,22 @@ class SqueezeKernelEstimator:
             if den > 0.0:
                 z_t[i] = num / den
 
-    def _extract(self, vol_t: np.ndarray, M_t=None, S_in=None) -> tuple[np.ndarray, np.ndarray]:
-        eps = self.epsilon
-        M_t = self._M_t if M_t is None else M_t
-        S_t = max(self._S_t if S_in is None else S_in, eps)
-        n = self.n_assets
+    def _shrunk_corr_from_Q(self, Q: np.ndarray, S_t: float) -> np.ndarray:
+        """Normalise one Q state to a correlation and shrink it in place.
 
-        # Normalised standardised covariance matrix sigma_z = M_t / S_t.
-        # Compute correlations directly into the cached scratch buffer to
-        # avoid two intermediate allocations (sigma_z and corr).
-        diag_z = np.diagonal(M_t).copy()
-        diag_z /= S_t                                # in-place
+        Returns ``self._scratch_corr`` — valid only until the next call.
+        """
+        eps = self.epsilon
+        n = self.n_assets
+        S_t = max(S_t, eps)
+
+        # corr_ij = Q_ij * inv_diag_i * inv_diag_j; the scalar S_t cancels
+        # in the normalisation, so Q needs no rescaling pass.
+        diag_z = np.diagonal(Q).copy()
         inv_diag = 1.0 / np.sqrt(np.maximum(diag_z, eps))
-        # corr_ij = (M_ij / S_t) * inv_diag_i * inv_diag_j; this writes
-        # the rescaled outer-product into _scratch_corr in one pass.
         np.multiply.outer(inv_diag, inv_diag, out=self._scratch_corr)
         corr = self._scratch_corr
-        corr *= M_t                                  # in-place; corr = sigma_z * outer(inv_diag,inv_diag)
-        corr *= (1.0 / S_t)                          # absorb the M_t / S_t scale
+        corr *= Q                                    # in-place
         np.fill_diagonal(corr, np.where(diag_z > eps, 1.0, 0.0))
 
         # Adaptive shrinkage: blend toward the equicorrelation target
@@ -484,6 +504,9 @@ class SqueezeKernelEstimator:
             # Off-diagonal mean: O(n^2) sum, no mask allocation.
             rho_bar = (corr.sum() - corr.trace()) / self._n_off
             if self.shrinkage_target == "equicorrelation" or rho_bar <= 0.0:
+                # rho_bar <= 0 also covers the q = meanoff(C o C) = 0 corner:
+                # C o C has nonnegative entries, so q = 0 forces C = I and
+                # hence rho_bar = 0 — the equicorrelation fallback applies.
                 corr *= (1.0 - alpha)
                 corr += alpha * rho_bar
                 np.fill_diagonal(corr, 1.0)
@@ -495,27 +518,54 @@ class SqueezeKernelEstimator:
                 # level-matched so the target carries the same average
                 # correlation mass as the equicorrelation target.  As
                 # alpha -> 0 this reduces exactly to the published estimator.
-                had = corr * corr                       # Hadamard square, O(n^2)
+                had = self._scratch_had
+                np.multiply(corr, corr, out=had)        # Hadamard square, O(n^2)
                 mean_off = (had.sum() - np.trace(had)) / self._n_off
                 gamma = min(1.0, rho_bar / max(mean_off, eps))
                 corr *= (1.0 - alpha)
                 corr += (alpha * (1.0 - alpha)) * rho_bar
-                corr += (alpha * alpha * gamma) * had
+                had *= alpha * alpha * gamma
+                corr += had
                 np.fill_diagonal(corr, 1.0)
+        return corr
 
-        # Build covariance from corr and vol_t.  We need an output array
-        # that the caller can keep, so allocate one cov here (cannot reuse
-        # corr buffer because both are returned).
-        cov = corr * np.outer(vol_t, vol_t)
-        # Defensive symmetrisation against floating-point asymmetry.
-        cov += cov.T
-        cov *= 0.5
-        # Return a copy of corr so callers see a stable snapshot even if
-        # the next update() overwrites the scratch buffer.
-        corr_out = corr.copy()
-        corr_out += corr_out.T
-        corr_out *= 0.5
-        return cov, corr_out
+    def _materialize(self) -> None:
+        """Extract _cov/_corr from the current state (lazy, on demand)."""
+        eps = self.epsilon
+        vol_t = self._vol_t
+        if self._corr_lam is None:
+            # ── Single scale: shrunk correlation IS the correlation output ──
+            corr = self._shrunk_corr_from_Q(self._Q_t, self._S_t)
+            np.multiply.outer(vol_t, vol_t, out=self._scratch_outer)
+            cov = corr * self._scratch_outer
+            cov += cov.T
+            cov *= 0.5
+            corr_out = corr.copy()
+            corr_out += corr_out.T
+            corr_out *= 0.5
+            self._cov, self._corr = cov, corr_out
+        else:
+            # ── Ladder: blend per-rung shrunk correlations, then apply the
+            # (shared) volatilities once — algebraically identical to
+            # blending per-rung covariances, K-1 fewer O(n^2) passes.
+            mix = np.zeros((self.n_assets, self.n_assets), dtype=np.float64)
+            for k in range(self._corr_lam.size):
+                corr_k = self._shrunk_corr_from_Q(self._Q_list[k], self._S_list[k])
+                corr_k *= self._corr_w[k]
+                mix += corr_k
+            cov = mix
+            np.multiply.outer(vol_t, vol_t, out=self._scratch_outer)
+            cov *= self._scratch_outer
+            cov += cov.T
+            cov *= 0.5
+            self._cov = cov
+            # Correlation is re-derived from the blended covariance (not the
+            # blended correlation mix) to keep the published dead-asset
+            # semantics: rows of never-observed assets renormalise to zero.
+            d = np.sqrt(np.maximum(np.diagonal(cov), eps))
+            self._corr = cov / np.outer(d, d)
+            np.fill_diagonal(self._corr, 1.0)
+        self._dirty = False
 
 
 # ── Kernel resolution ─────────────────────────────────────────────────────────
