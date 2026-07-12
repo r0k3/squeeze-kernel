@@ -134,6 +134,24 @@ class SqueezeKernelEstimator:
     corr_theta : float
         Long-memory exponent controlling the ladder weights (default
         0.25).  Only used when ``corr_half_lives`` is set.
+    min_obs : int or None
+        Usability gate for newly listed assets.  When set, the property
+        ``usable_mask`` marks an asset usable only once it has delivered
+        at least ``min_obs`` finite observations.  The gate is purely
+        diagnostic: state evolution and ``get_cov``/``get_corr`` are
+        unchanged (the states keep warming during the gated window, so an
+        asset is fully warm when the gate lifts).  Motivation: on an
+        expanding multi-asset universe, forecast rows for assets in their
+        first ~100 observations are dominated by the single-observation
+        variance initialisation and are unusable for scoring or portfolio
+        construction (measured ≈ +2,800 NLL/day on days whose scored set
+        included such assets).  Deployment recipe::
+
+            m = est.usable_mask
+            cov_usable = est.get_cov()[np.ix_(m, m)]
+
+        Recommended ``min_obs`` ≈ 60–100 for daily data.  ``None``
+        (default) disables the gate (``usable_mask`` is all-True).
 
     Examples
     --------
@@ -167,6 +185,7 @@ class SqueezeKernelEstimator:
         shrinkage_target: str = "equicorrelation",
         corr_half_lives: "Sequence[float] | None" = None,
         corr_theta: float = 0.25,
+        min_obs: int | None = None,
     ):
         self.n_assets = n_assets
         self.lambda_vol = lambda_vol
@@ -192,6 +211,10 @@ class SqueezeKernelEstimator:
         if shrinkage_target not in ("equicorrelation", "cluster"):
             raise ValueError("shrinkage_target must be 'equicorrelation' or 'cluster'.")
         self.shrinkage_target = shrinkage_target
+        if min_obs is not None and (not isinstance(min_obs, int) or min_obs < 1):
+            raise ValueError("min_obs must be a positive integer or None.")
+        self.min_obs = min_obs
+        self._obs_count = np.zeros(n_assets, dtype=np.int64)
 
         # Scale-free correlation memory (opt-in): replace the single correlation
         # timescale by a positive combination of EWMAs on a geometric half-life
@@ -282,6 +305,7 @@ class SqueezeKernelEstimator:
             raise ValueError(f"Expected shape ({n},), got {r_t.shape}.")
 
         finite = np.isfinite(r_t)
+        self._obs_count[finite] += 1
 
         # ── Volatility update ──
         if self._var_t is None:
@@ -410,6 +434,17 @@ class SqueezeKernelEstimator:
     def weight(self) -> float:
         """Kernel weight assigned to the most recent observation."""
         return self._last_weight
+
+    @property
+    def usable_mask(self) -> np.ndarray:
+        """Boolean mask of assets with at least ``min_obs`` observations.
+
+        All-True when ``min_obs`` is None. Purely diagnostic — estimates
+        are not affected; subset the outputs with it (see class docstring).
+        """
+        if self.min_obs is None:
+            return np.ones(self.n_assets, dtype=bool)
+        return self._obs_count >= self.min_obs
 
     @property
     def effective_sample_size(self) -> float:

@@ -114,6 +114,15 @@ est = SqueezeKernelEstimator(n_assets=100, vol_anchor_phi=0.995)
 est = SqueezeKernelEstimator(n_assets=300, shrinkage_target="cluster")
 ```
 
+**New-listing usability gate** (`min_obs=60`): on an expanding universe, an asset's forecast rows are dominated by its single-observation variance initialization for its first weeks of life and are unusable for scoring or portfolio construction (measured ≈ +2,800 NLL/day on days whose scored set included such assets, on a 42-instrument multi-asset panel). `min_obs` gates nothing inside the estimator — states warm normally, all outputs are unchanged — it exposes a `usable_mask` property marking assets with at least `min_obs` finite observations, so deployments subset with it:
+
+```python
+est = SqueezeKernelEstimator(n_assets=42, min_obs=60)
+# ... update loop ...
+m = est.usable_mask
+cov_usable = est.get_cov()[np.ix_(m, m)]
+```
+
 **Alternative kernels**: pass `kernel_fn=kernel_exponential` (with `kernel_kwargs={"gamma": ...}`) or `kernel_chi2_cdf`, or any callable `(d2, *, n_observed, **kw) -> float` mapping to `[0, 1)`. The PSD guarantee holds for any such kernel.
 
 ## How it works
