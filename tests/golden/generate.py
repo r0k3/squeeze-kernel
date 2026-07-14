@@ -1,7 +1,8 @@
 """Regenerate the golden .npz files from the current estimator.
 
-Run ONLY from a commit whose behaviour is the accepted baseline (B0 =
-v0.5.0, commit 0d44ecf):  uv run python tests/golden/generate.py
+Run ONLY from a commit whose behaviour is the accepted baseline (v0.6.0
+headline: adaptive-blend ladder + cluster target, detector integral):
+uv run python tests/golden/generate.py
 """
 
 import sys

@@ -1,4 +1,4 @@
-"""Tests for the CUSUM-gated adaptive ladder weights."""
+"""Tests for the CUSUM-gated adaptive ladder weights (integral for K >= 2)."""
 
 import numpy as np
 import pytest
@@ -9,38 +9,39 @@ LADDER = [43.0, 173.0, 693.0]
 
 
 class TestAdaptiveWeights:
-    def test_default_unchanged(self, returns_medium):
-        a = SqueezeKernelEstimator(30, corr_half_lives=LADDER)
-        b = SqueezeKernelEstimator(30, corr_half_lives=LADDER,
-                                   adaptive_weights=None)
+    def test_one_rung_ladder_has_no_detector(self, returns_medium):
+        """A one-element ladder is a single-scale estimator: no detector
+        state, and the lazy extraction path is used."""
+        est = SqueezeKernelEstimator(30, corr_half_lives=[173.0])
+        assert not est._adaptive
         for r in returns_medium:
-            a.update(r)
-            b.update(r)
-        assert np.array_equal(a.get_cov(), b.get_cov())
+            est.update(r)
+        assert np.isfinite(est.get_cov()).all()
 
-    def test_validation(self):
-        with pytest.raises(ValueError, match="adaptive_weights"):
-            SqueezeKernelEstimator(5, corr_half_lives=LADDER,
-                                   adaptive_weights="bogus")
-        with pytest.raises(ValueError, match="requires corr_half_lives"):
-            SqueezeKernelEstimator(5, adaptive_weights="cusum")
+    def test_multi_rung_ladder_runs_detector(self, returns_medium):
+        est = SqueezeKernelEstimator(30, corr_half_lives=LADDER)
+        assert est._adaptive
+        for r in returns_medium:
+            est.update(r)
+        assert est._aw_prev_sig is not None
+        assert len(est._aw_prev_sig) == len(LADDER)
 
     def test_psd_and_unit_diag(self, returns_medium):
         est = SqueezeKernelEstimator(30, corr_half_lives=LADDER,
-                                     shrinkage_target="cluster",
-                                     adaptive_weights="cusum")
+                                     shrinkage_target="cluster")
         for r in returns_medium:
             est.update(r)
             assert np.linalg.eigvalsh(est.get_cov()).min() >= -1e-10
         assert np.allclose(np.diag(est.get_corr()), 1.0)
 
-    def test_no_alarm_equals_fixed(self, rng):
-        """With the detector's tilt at zero the blend equals the fixed
-        theta-prior blend exactly (state paths are identical)."""
+    def test_no_alarm_equals_prior_blend(self, rng):
+        """With the detector's tilt at zero the blend equals the theta-prior
+        blend exactly: against a twin whose threshold never fires (state
+        paths are identical; the tilt only affects extraction)."""
         x = rng.normal(0, 0.01, size=(120, 8))
-        a = SqueezeKernelEstimator(8, corr_half_lives=LADDER,
-                                   adaptive_weights="cusum")
+        a = SqueezeKernelEstimator(8, corr_half_lives=LADDER)
         b = SqueezeKernelEstimator(8, corr_half_lives=LADDER)
+        b._aw_b = float("inf")          # detector can never alarm
         for r in x:
             a.update(r)
             b.update(r)
@@ -51,8 +52,7 @@ class TestAdaptiveWeights:
     def test_tilt_blend_geometry(self, rng):
         """A forced tilt moves weights toward the declared tilt vector."""
         x = rng.normal(0, 0.01, size=(80, 8))
-        est = SqueezeKernelEstimator(8, corr_half_lives=LADDER,
-                                     adaptive_weights="cusum")
+        est = SqueezeKernelEstimator(8, corr_half_lives=LADDER)
         for r in x:
             est.update(r)
         est._aw_tilt = 0.5
@@ -64,8 +64,7 @@ class TestAdaptiveWeights:
         assert not np.allclose(cov_tilted, cov_prior)
 
     def test_masked_updates_run(self, returns_with_nans):
-        est = SqueezeKernelEstimator(10, corr_half_lives=LADDER,
-                                     adaptive_weights="cusum")
+        est = SqueezeKernelEstimator(10, corr_half_lives=LADDER)
         for r in returns_with_nans:
             est.update(r)
         assert np.isfinite(est.get_cov()).all()

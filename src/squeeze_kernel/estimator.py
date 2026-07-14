@@ -113,44 +113,45 @@ class SqueezeKernelEstimator:
         benchmark: +0.14 (negligible) at n=100, −4.2 at n=200, −25.0 at
         n=300.  Recommended when n approaches the effective sample size.
     corr_half_lives : sequence of float, optional
-        Scale-free correlation memory.  When set, the single correlation
-        timescale is replaced by a positive combination of EWMAs on the
-        given geometric half-life ladder (in trading days, e.g.
-        ``(43, 173, 693)``): each scale is normalised and adaptively
-        shrunk against its own effective sample size, and the resulting
-        covariances are blended with weights ∝ half-life\\ :sup:`corr_theta`.
-        By Bernstein's theorem this approximates the power-law memory of
-        financial correlations (the streaming analogue of HAR).  PSD by
-        construction (positive combination of PSD matrices).  ``None``
-        (default) is the published single-scale estimator, bit-for-bit;
-        a one-element ladder reduces to a single-scale estimator at that
-        half-life.  Mutually exclusive with ``lambda_corr_fast``; composes
-        with ``shrinkage_target='cluster'``.  Cost is O(K·n²) per update.
-        Held-out one-step NLL on the S&P-500 benchmark improves at every
-        dimension (−3.9 at n=100, up to −18 at n=300 before the cluster
-        target); the $90\\%$ model confidence set collapses to this
-        configuration alone.  Recommended default: the base-centred ladder
-        ``(43, 173, 693)`` with ``corr_theta=0.25``.
-    corr_theta : float
-        Long-memory exponent controlling the ladder weights (default
-        0.25).  Only used when ``corr_half_lives`` is set.
-    adaptive_weights : str or None
-        Sequential surprise-gated adaptation of the ladder blend weights
-        (requires ``corr_half_lives``).  ``"cusum"`` runs a two-sided Page
-        CUSUM on the studentised fast-vs-slow per-rung predictive-score
-        drift (reference drift 0.5, threshold 4.9721 = Siegmund
-        average-run-length ~2 years); an alarm applies a half-magnitude
-        tilt of the theta-prior toward the inverse-horizon vector (fast
-        alarms, w ~ 1/h) or the square-root-horizon vector (slow alarms,
+        Scale-free correlation memory with surprise-gated adaptive blend
+        weights.  When set, the single correlation timescale is replaced
+        by a positive combination of EWMAs on the given geometric
+        half-life ladder (in trading days, e.g. ``(43, 173, 693)``): each
+        scale is normalised and adaptively shrunk against its own
+        effective sample size, and the resulting covariances are blended
+        with weights resting at the prior ∝ half-life\\ :sup:`corr_theta`.
+        By Bernstein's theorem the ladder approximates the power-law
+        memory of financial correlations (the streaming analogue of HAR).
+        For ladders of two or more rungs the blend weights are gated by a
+        sequential surprise detector: a two-sided Page CUSUM on the
+        studentised fast-vs-slow per-rung predictive-score drift
+        (reference drift 0.5, threshold 4.9721 = Siegmund average-run-
+        length ~2 years); an alarm applies a half-magnitude tilt of the
+        theta-prior toward the inverse-horizon vector (fast alarms,
+        w ~ 1/h) or the square-root-horizon vector (slow alarms,
         w ~ h^0.5), decaying at the fastest rung's half-life.  Weights
-        equal the prior on all non-alarmed days; PSD is untouched (the
-        blend stays convex).  Adds five scalars of state and one Cholesky
-        per rung per update for the scores.  Validated across S&P panels
-        (held-out +0.5-0.6 NLL/day), an external industry panel incl. an
-        out-of-time seal (+0.53/day, p=1e-4), a multi-asset futures panel,
-        and synthetic regime/null suites; a one-at-a-time sensitivity
-        sweep over all structural constants is sign-stable.  ``None``
-        (default) keeps the fixed theta-prior blend bit-for-bit.
+        equal the prior on all non-alarmed days and the blend stays
+        convex, so PSD is structural throughout.  The detector adds five
+        scalars of state and one Cholesky per rung per update for the
+        scores; it is validated across S&P panels (held-out +0.5-0.6
+        NLL/day over the detector-off blend), an external industry panel
+        incl. an out-of-time seal (+0.53/day, p=1e-4), a multi-asset
+        futures panel, and synthetic regime/null suites, with a
+        sign-stable one-at-a-time sensitivity sweep over all structural
+        constants.  ``None`` (default) is the published single-scale
+        estimator, bit-for-bit; a one-element ladder reduces to a
+        single-scale estimator at that half-life (no detector).
+        Mutually exclusive with ``lambda_corr_fast``; composes with
+        ``shrinkage_target='cluster'``.  Cost is O(K·n²) per update plus
+        the detector's per-rung score factorisations.  Held-out one-step
+        NLL on the S&P-500 benchmark improves on the single-scale
+        estimator at every dimension (−4.6 at n=100, −11.1 at n=300
+        before the cluster target); the $90\\%$ model confidence set
+        collapses to this configuration alone.  Recommended default: the
+        base-centred ladder ``(43, 173, 693)`` with ``corr_theta=0.25``.
+    corr_theta : float
+        Long-memory exponent controlling the resting blend weights
+        (default 0.25).  Only used when ``corr_half_lives`` is set.
     min_obs : int or None
         Usability gate for newly listed assets.  When set, the property
         ``usable_mask`` marks an asset usable only once it has delivered
@@ -203,7 +204,6 @@ class SqueezeKernelEstimator:
         corr_half_lives: "Sequence[float] | None" = None,
         corr_theta: float = 0.25,
         min_obs: int | None = None,
-        adaptive_weights: str | None = None,
     ):
         self.n_assets = n_assets
         self.lambda_vol = lambda_vol
@@ -233,24 +233,6 @@ class SqueezeKernelEstimator:
             raise ValueError("min_obs must be a positive integer or None.")
         self.min_obs = min_obs
         self._obs_count = np.zeros(n_assets, dtype=np.int64)
-        if adaptive_weights not in (None, "cusum"):
-            raise ValueError("adaptive_weights must be None or 'cusum'.")
-        if adaptive_weights is not None and corr_half_lives is None:
-            raise ValueError("adaptive_weights requires corr_half_lives.")
-        self.adaptive_weights = adaptive_weights
-        if adaptive_weights is not None:
-            hl_arr = np.asarray(corr_half_lives, dtype=np.float64)
-            self._aw_pi_fast = (1.0 / hl_arr) / (1.0 / hl_arr).sum()
-            self._aw_pi_slow = hl_arr ** 0.5 / (hl_arr ** 0.5).sum()
-            self._aw_lam_tilt = 2.0 ** (-1.0 / float(hl_arr.min()))
-            self._aw_gamma_scale = 2.0 ** (-1.0 / float(np.median(hl_arr)))
-            # Page CUSUM: drift 0.5, threshold from Siegmund's ARL
-            # approximation at ARL0 = 504 trading days (~2 years).
-            self._aw_drift, self._aw_b, self._aw_snap = 0.5, 4.9721088583, 0.5
-            self._aw_gp = self._aw_gm = 0.0
-            self._aw_tilt = 0.0
-            self._aw_scale = 1.0
-            self._aw_prev_sig: list[np.ndarray] | None = None
 
         # Scale-free correlation memory (opt-in): replace the single correlation
         # timescale by a positive combination of EWMAs on a geometric half-life
@@ -262,6 +244,7 @@ class SqueezeKernelEstimator:
         self._corr_w: np.ndarray | None = None
         self._Q_list: list[np.ndarray] | None = None
         self._S_list: list[float] | None = None
+        self._adaptive = False
         if corr_half_lives is not None:
             hl = np.asarray(corr_half_lives, dtype=np.float64)
             if hl.ndim != 1 or hl.size < 1 or np.any(hl <= 0.0):
@@ -279,6 +262,21 @@ class SqueezeKernelEstimator:
             self._corr_w = w / w.sum()
             self._Q_list = [np.eye(n_assets, dtype=np.float64) for _ in hl]
             self._S_list = [float(epsilon) for _ in hl]
+            # Surprise-gated blend weights (integral for K >= 2): two-sided
+            # Page CUSUM on the studentised fast-vs-slow per-rung
+            # predictive-score drift; drift 0.5, threshold from Siegmund's
+            # ARL approximation at ARL0 = 504 trading days (~2 years).
+            self._adaptive = hl.size >= 2
+            if self._adaptive:
+                self._aw_pi_fast = (1.0 / hl) / (1.0 / hl).sum()
+                self._aw_pi_slow = hl ** 0.5 / (hl ** 0.5).sum()
+                self._aw_lam_tilt = 2.0 ** (-1.0 / float(hl.min()))
+                self._aw_gamma_scale = 2.0 ** (-1.0 / float(np.median(hl)))
+                self._aw_drift, self._aw_b, self._aw_snap = 0.5, 4.9721088583, 0.5
+                self._aw_gp = self._aw_gm = 0.0
+                self._aw_tilt = 0.0
+                self._aw_scale = 1.0
+                self._aw_prev_sig: list[np.ndarray] | None = None
 
         # Resolve shrinkage
         if isinstance(shrinkage, str):
@@ -346,7 +344,7 @@ class SqueezeKernelEstimator:
         # ── Adaptive-weight detector: score r_t under yesterday's per-rung
         # forecasts, then advance the CUSUM (weights used below therefore
         # reflect information through r_t only — causal). ──
-        if (self.adaptive_weights is not None and self._aw_prev_sig is not None
+        if (self._adaptive and self._aw_prev_sig is not None
                 and finite.any()):
             oidx = np.flatnonzero(finite)
             r_o = r_t[oidx]
@@ -492,7 +490,7 @@ class SqueezeKernelEstimator:
             self._S_t = s_eff                        # blended effective size (for the property)
         self._vol_t = vol_t
         self._dirty = True
-        if self.adaptive_weights is not None and self._corr_lam is not None:
+        if self._adaptive:
             self._materialize_adaptive()
         self._last_weight = w_t
         return w_t

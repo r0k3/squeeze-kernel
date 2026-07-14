@@ -4,7 +4,8 @@ Each scenario returns a (T, n) float array (NaN = missing) built from a
 seeded generator, so the inputs are reproducible from source. The golden
 outputs in tests/golden/*.npz pin the exact covariance path of the
 combined cluster + scale-free estimator (the papers' headline
-configuration) as shipped in v0.5.0.
+configuration: adaptive-blend ladder + cluster target, detector
+integral) as of v0.6.0.
 """
 
 import numpy as np
