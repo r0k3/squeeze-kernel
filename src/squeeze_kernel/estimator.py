@@ -6,6 +6,15 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+try:
+    # SciPy's direct LAPACK bindings factorise an SPD matrix ~4x faster than
+    # the NumPy slogdet+solve route (one dpotrf vs two LU factorisations) and
+    # compute the identical quantities; the detector falls back to the
+    # NumPy-only path when SciPy is absent.
+    from scipy.linalg import cho_factor as _cho_factor, cho_solve as _cho_solve
+except ImportError:  # pragma: no cover
+    _cho_factor = _cho_solve = None
+
 from squeeze_kernel.kernels import (
     KernelFn, kernel_fisher, calibrate_kappa, extract_d2_series,
 )
@@ -353,15 +362,26 @@ class SqueezeKernelEstimator:
             for k, sig in enumerate(self._aw_prev_sig):
                 sub = sig[np.ix_(oidx, oidx)]
                 sub = (sub + sub.T) * 0.5
-                sign, logdet = np.linalg.slogdet(sub)
-                if sign <= 0:
-                    ok = False               # degenerate day (e.g. a fresh
-                    break                    # listing): no clean score
-                try:
-                    quad = float(r_o @ np.linalg.solve(sub, r_o))
-                except np.linalg.LinAlgError:
-                    ok = False
-                    break
+                if _cho_factor is not None:
+                    # One Cholesky per rung: logdet from the factor's
+                    # diagonal, quadratic form via triangular solves.
+                    try:
+                        cf = _cho_factor(sub, lower=True, check_finite=False)
+                    except np.linalg.LinAlgError:
+                        ok = False           # degenerate day (e.g. a fresh
+                        break                # listing): no clean score
+                    logdet = 2.0 * np.log(np.diagonal(cf[0])).sum()
+                    quad = float(r_o @ _cho_solve(cf, r_o, check_finite=False))
+                else:
+                    sign, logdet = np.linalg.slogdet(sub)
+                    if sign <= 0:
+                        ok = False           # degenerate day (e.g. a fresh
+                        break                # listing): no clean score
+                    try:
+                        quad = float(r_o @ np.linalg.solve(sub, r_o))
+                    except np.linalg.LinAlgError:
+                        ok = False
+                        break
                 ell[k] = -0.5 * (oidx.size * np.log(2 * np.pi) + logdet + quad)
             if not ok:
                 self._aw_tilt *= self._aw_lam_tilt

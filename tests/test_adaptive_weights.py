@@ -68,3 +68,24 @@ class TestAdaptiveWeights:
         for r in returns_with_nans:
             est.update(r)
         assert np.isfinite(est.get_cov()).all()
+
+    def test_score_paths_agree(self, monkeypatch, rng):
+        """The SciPy Cholesky score path and the NumPy slogdet+solve
+        fallback compute the same quantities: identical covariance paths
+        and detector states on the same input."""
+        import squeeze_kernel.estimator as mod
+        if mod._cho_factor is None:
+            pytest.skip("SciPy not installed; only the fallback path exists")
+        x = rng.normal(0, 0.01, size=(150, 12))
+        x[40] *= 8.0                       # a shock so scores move
+        a = SqueezeKernelEstimator(12, corr_half_lives=LADDER)
+        for r in x:
+            a.update(r)
+        cov_scipy, state_scipy = a.get_cov(), (a._aw_gp, a._aw_gm, a._aw_tilt)
+        monkeypatch.setattr(mod, "_cho_factor", None)
+        b = SqueezeKernelEstimator(12, corr_half_lives=LADDER)
+        for r in x:
+            b.update(r)
+        np.testing.assert_allclose(b.get_cov(), cov_scipy, rtol=1e-9, atol=0)
+        np.testing.assert_allclose(
+            (b._aw_gp, b._aw_gm, b._aw_tilt), state_scipy, rtol=1e-9, atol=1e-12)
