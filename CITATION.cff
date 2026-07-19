@@ -2,7 +2,7 @@ cff-version: 1.2.0
 message: "If you use this software, please cite it using the metadata below."
 title: "Squeeze Kernel Covariance Estimator"
 type: software
-version: "0.5.0"
+version: "0.6.0"
 license: MIT
 repository-code: "https://github.com/r0k3/squeeze-kernel"
 url: "https://github.com/r0k3/squeeze-kernel"
