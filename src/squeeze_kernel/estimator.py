@@ -18,9 +18,116 @@ except ImportError:  # pragma: no cover
 from squeeze_kernel.kernels import (
     KernelFn, kernel_fisher, calibrate_kappa, extract_d2_series,
 )
+from numpy.typing import ArrayLike
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+
+class _SurpriseDetector:
+    """Two-sided Page CUSUM on the studentised fast-vs-slow per-rung
+    predictive-score drift.
+
+    Gates the blend weights of the scale-free correlation ladder: on each
+    update the day is scored under every rung's previous (t-1) covariance
+    — causal, since ``record`` is called with the rung states *after* the
+    update — and the drift of the centred rung scores advances the CUSUM.
+    An alarm sets a half-magnitude tilt of the theta-prior toward the
+    inverse-horizon vector (fast alarm) or the square-root-horizon vector
+    (slow alarm); on all other days the tilt decays at the fastest rung's
+    half-life.  State: five scalars (``gp``, ``gm``, ``tilt``, ``scale``
+    and the cached ``prev_sig`` rung covariances).
+    """
+
+    _DRIFT = 0.5
+    _THRESHOLD = 4.9721088583   # Siegmund ARL approximation at ~2 years
+    _SNAP = 0.5
+    _CLIP = 3.0
+    _JITTER = 1e-12
+
+    def __init__(self, half_lives: np.ndarray) -> None:
+        hl = half_lives
+        self.pi_fast = (1.0 / hl) / (1.0 / hl).sum()
+        self.pi_slow = hl ** 0.5 / (hl ** 0.5).sum()
+        self._lam_tilt = 2.0 ** (-1.0 / float(hl.min()))
+        self._gamma_scale = 2.0 ** (-1.0 / float(np.median(hl)))
+        self._k_fast = int(np.argmin(hl))
+        self._k_slow = int(np.argmax(hl))
+        self.gp = 0.0
+        self.gm = 0.0
+        self.tilt = 0.0
+        self.scale = 1.0
+        self.prev_sig: list[np.ndarray] | None = None
+
+    def score(self, r_t: np.ndarray, finite: np.ndarray) -> np.ndarray | None:
+        """Per-rung Gaussian log-likelihood of ``r_t`` under ``prev_sig``,
+        restricted to the observed assets.  Returns None when there is no
+        previous state, nothing is observed, or the day is degenerate
+        (e.g. a fresh listing); a degenerate day also decays the tilt."""
+        if self.prev_sig is None or not finite.any():
+            return None
+        oidx = np.flatnonzero(finite)
+        r_o = r_t[oidx]
+        ell = np.empty(len(self.prev_sig))
+        for k, sig in enumerate(self.prev_sig):
+            sub = sig[np.ix_(oidx, oidx)]
+            sub = (sub + sub.T) * 0.5
+            if _cho_factor is not None:
+                # One Cholesky per rung: logdet from the factor's
+                # diagonal, quadratic form via triangular solves.
+                try:
+                    cf = _cho_factor(sub, lower=True, check_finite=False)
+                except np.linalg.LinAlgError:
+                    self.tilt *= self._lam_tilt
+                    return None
+                logdet = 2.0 * np.log(np.diagonal(cf[0])).sum()
+                quad = float(r_o @ _cho_solve(cf, r_o, check_finite=False))
+            else:
+                sign, logdet = np.linalg.slogdet(sub)
+                if sign <= 0:
+                    self.tilt *= self._lam_tilt
+                    return None
+                try:
+                    quad = float(r_o @ np.linalg.solve(sub, r_o))
+                except np.linalg.LinAlgError:
+                    self.tilt *= self._lam_tilt
+                    return None
+            ell[k] = -0.5 * (oidx.size * np.log(2 * np.pi) + logdet + quad)
+        return ell
+
+    def advance(self, ell: np.ndarray | None) -> None:
+        """Advance the CUSUM with the rung scores for this day.  ``None``
+        (no clean score) is a no-op: the degenerate-day tilt decay already
+        happened inside ``score``."""
+        if ell is None:
+            return
+        dd = ell - ell.mean()
+        rms = float(np.sqrt((dd @ dd) / ell.size))
+        self.scale = (self._gamma_scale * self.scale
+                      + (1.0 - self._gamma_scale) * rms)
+        zc = np.clip(dd / (self.scale + self._JITTER), -self._CLIP, self._CLIP)
+        zfs = float(zc[self._k_fast] - zc[self._k_slow])
+        self.gp = max(0.0, self.gp + zfs - self._DRIFT)
+        self.gm = max(0.0, self.gm - zfs - self._DRIFT)
+        if self.gp > self._THRESHOLD:
+            self.tilt, self.gp = self._SNAP, 0.0
+        elif self.gm > self._THRESHOLD:
+            self.tilt, self.gm = -self._SNAP, 0.0
+        else:
+            self.tilt *= self._lam_tilt
+
+    def record(self, rung_covs: list[np.ndarray]) -> None:
+        """Cache this step's rung covariances as next step's forecasts."""
+        self.prev_sig = rung_covs
+
+    def blend(self, prior: np.ndarray) -> np.ndarray:
+        """Blend weights for the rung covariances: the theta-prior on
+        non-alarmed days, tilted half-magnitude toward the horizon vectors
+        while an alarm is live.  Convex in both regimes."""
+        t = self.tilt
+        if t >= 0:
+            return np.asarray((1.0 - t) * prior + t * self.pi_fast)
+        return np.asarray((1.0 + t) * prior + (-t) * self.pi_slow)
 
 
 class SqueezeKernelEstimator:
@@ -251,6 +358,7 @@ class SqueezeKernelEstimator:
         self.corr_theta = corr_theta
         self._corr_lam: np.ndarray | None = None
         self._corr_w: np.ndarray | None = None
+        self._detector: _SurpriseDetector | None = None
         self._Q_list: list[np.ndarray] | None = None
         self._S_list: list[float] | None = None
         self._adaptive = False
@@ -271,21 +379,11 @@ class SqueezeKernelEstimator:
             self._corr_w = w / w.sum()
             self._Q_list = [np.eye(n_assets, dtype=np.float64) for _ in hl]
             self._S_list = [float(epsilon) for _ in hl]
-            # Surprise-gated blend weights (integral for K >= 2): two-sided
-            # Page CUSUM on the studentised fast-vs-slow per-rung
-            # predictive-score drift; drift 0.5, threshold from Siegmund's
-            # ARL approximation at ARL0 = 504 trading days (~2 years).
+            # Surprise-gated blend weights (integral for K >= 2): see
+            # ``_SurpriseDetector``.
             self._adaptive = hl.size >= 2
             if self._adaptive:
-                self._aw_pi_fast = (1.0 / hl) / (1.0 / hl).sum()
-                self._aw_pi_slow = hl ** 0.5 / (hl ** 0.5).sum()
-                self._aw_lam_tilt = 2.0 ** (-1.0 / float(hl.min()))
-                self._aw_gamma_scale = 2.0 ** (-1.0 / float(np.median(hl)))
-                self._aw_drift, self._aw_b, self._aw_snap = 0.5, 4.9721088583, 0.5
-                self._aw_gp = self._aw_gm = 0.0
-                self._aw_tilt = 0.0
-                self._aw_scale = 1.0
-                self._aw_prev_sig: list[np.ndarray] | None = None
+                self._detector = _SurpriseDetector(hl)
 
         # Resolve shrinkage
         if isinstance(shrinkage, str):
@@ -328,7 +426,7 @@ class SqueezeKernelEstimator:
 
     # ── Public API ────────────────────────────────────────────────────────
 
-    def update(self, r_t) -> float:
+    def update(self, r_t: ArrayLike) -> float:
         """Process one return vector and update the covariance estimate.
 
         Parameters
@@ -353,77 +451,37 @@ class SqueezeKernelEstimator:
         # ── Adaptive-weight detector: score r_t under yesterday's per-rung
         # forecasts, then advance the CUSUM (weights used below therefore
         # reflect information through r_t only — causal). ──
-        if (self._adaptive and self._aw_prev_sig is not None
-                and finite.any()):
-            oidx = np.flatnonzero(finite)
-            r_o = r_t[oidx]
-            ell = np.empty(len(self._aw_prev_sig))
-            ok = True
-            for k, sig in enumerate(self._aw_prev_sig):
-                sub = sig[np.ix_(oidx, oidx)]
-                sub = (sub + sub.T) * 0.5
-                if _cho_factor is not None:
-                    # One Cholesky per rung: logdet from the factor's
-                    # diagonal, quadratic form via triangular solves.
-                    try:
-                        cf = _cho_factor(sub, lower=True, check_finite=False)
-                    except np.linalg.LinAlgError:
-                        ok = False           # degenerate day (e.g. a fresh
-                        break                # listing): no clean score
-                    logdet = 2.0 * np.log(np.diagonal(cf[0])).sum()
-                    quad = float(r_o @ _cho_solve(cf, r_o, check_finite=False))
-                else:
-                    sign, logdet = np.linalg.slogdet(sub)
-                    if sign <= 0:
-                        ok = False           # degenerate day (e.g. a fresh
-                        break                # listing): no clean score
-                    try:
-                        quad = float(r_o @ np.linalg.solve(sub, r_o))
-                    except np.linalg.LinAlgError:
-                        ok = False
-                        break
-                ell[k] = -0.5 * (oidx.size * np.log(2 * np.pi) + logdet + quad)
-            if not ok:
-                self._aw_tilt *= self._aw_lam_tilt
-                ell = None
-        else:
-            ell = None
-        if ell is not None:
-            dd = ell - ell.mean()
-            rms = float(np.sqrt((dd @ dd) / ell.size))
-            self._aw_scale = (self._aw_gamma_scale * self._aw_scale
-                              + (1.0 - self._aw_gamma_scale) * rms)
-            zc = np.clip(dd / (self._aw_scale + 1e-12), -3.0, 3.0)
-            k_fast = int(np.argmin(self.corr_half_lives))
-            k_slow = int(np.argmax(self.corr_half_lives))
-            zfs = float(zc[k_fast] - zc[k_slow])
-            self._aw_gp = max(0.0, self._aw_gp + zfs - self._aw_drift)
-            self._aw_gm = max(0.0, self._aw_gm - zfs - self._aw_drift)
-            if self._aw_gp > self._aw_b:
-                self._aw_tilt, self._aw_gp = self._aw_snap, 0.0
-            elif self._aw_gm > self._aw_b:
-                self._aw_tilt, self._aw_gm = -self._aw_snap, 0.0
-            else:
-                self._aw_tilt *= self._aw_lam_tilt
+        ell = None
+        detector = self._detector
+        if detector is not None:
+            ell = detector.score(r_t, finite)
+            detector.advance(ell)
 
         # ── Volatility update ──
-        if self._var_t is None:
-            self._var_t = np.zeros(n, dtype=np.float64)
-            self._var_init = np.zeros(n, dtype=bool)
+        # Locals alias the variance states: the guard initialises the pair
+        # together, so both are non-None afterwards, and local aliases keep
+        # the narrowing visible to mypy.
+        var_t = self._var_t
+        var_init = self._var_init
+        if var_t is None or var_init is None:
+            var_t = np.zeros(n, dtype=np.float64)
+            var_init = np.zeros(n, dtype=bool)
+            self._var_t = var_t
+            self._var_init = var_init
             if self.vol_anchor_phi is not None:
                 self._var_anchor = np.zeros(n, dtype=np.float64)
 
-        first = finite & ~self._var_init
-        repeat = finite & self._var_init
+        first = finite & ~var_init
+        repeat = finite & var_init
         if np.any(first):
-            self._var_t[first] = r_t[first] ** 2 + eps
-            self._var_init[first] = True
+            var_t[first] = r_t[first] ** 2 + eps
+            var_init[first] = True
             if self._var_anchor is not None:
-                self._var_anchor[first] = self._var_t[first]
+                self._var_anchor[first] = var_t[first]
         if np.any(repeat):
             if self.vol_anchor_phi is None:
-                self._var_t[repeat] = (
-                    self.lambda_vol * self._var_t[repeat]
+                var_t[repeat] = (
+                    self.lambda_vol * var_t[repeat]
                     + (1.0 - self.lambda_vol) * r_t[repeat] ** 2
                 )
             else:
@@ -431,20 +489,23 @@ class SqueezeKernelEstimator:
                 # per-asset anchor before the measurement update, then update
                 # the anchor itself (order matters and matches the validated
                 # experiment: prediction uses the *old* anchor).
+                var_anchor = self._var_anchor
+                assert var_anchor is not None
+                # allocated together with the anchor on the first update
                 phi = self.vol_anchor_phi
                 lam_bar = self.vol_anchor_decay
-                anchor = self._var_anchor[repeat]
-                v_pred = anchor + phi * (self._var_t[repeat] - anchor)
-                self._var_t[repeat] = (
+                anchor = var_anchor[repeat]
+                v_pred = anchor + phi * (var_t[repeat] - anchor)
+                var_t[repeat] = (
                     self.lambda_vol * v_pred
                     + (1.0 - self.lambda_vol) * r_t[repeat] ** 2
                 )
-                self._var_anchor[repeat] = (
+                var_anchor[repeat] = (
                     lam_bar * anchor + (1.0 - lam_bar) * r_t[repeat] ** 2
                 )
 
         vol_t = np.zeros(n, dtype=np.float64)
-        vol_t[self._var_init] = np.sqrt(self._var_t[self._var_init])
+        vol_t[var_init] = np.sqrt(var_t[var_init])
 
         # ── Standardized returns ──
         z_t = np.zeros(n, dtype=np.float64)
@@ -459,8 +520,10 @@ class SqueezeKernelEstimator:
                 # lazy, so bring _corr up to the t-1 state first.
                 if self._dirty:
                     self._materialize()
+                corr_prev = self._corr
+                assert corr_prev is not None   # _materialize always sets it
                 try:
-                    c_sub = self._corr[np.ix_(finite, finite)]
+                    c_sub = corr_prev[np.ix_(finite, finite)]
                     d2 = float(z_t[finite] @ np.linalg.solve(c_sub, z_t[finite])) / n_obs
                 except np.linalg.LinAlgError:
                     pass
@@ -478,9 +541,12 @@ class SqueezeKernelEstimator:
             # np.outer otherwise allocates each step. zz' is computed once
             # and shared by every rung.
             np.multiply.outer(z_t, z_t, out=self._scratch_outer)
-        if self._corr_lam is None:
+        corr_lam = self._corr_lam
+        if corr_lam is None:
             # ── Single-scale correlation EWMA (published path) ──
-            lam_c = self.lambda_corr
+            Q_t = self._Q_t
+            assert Q_t is not None     # the single-scale state exists exactly
+            lam_c = self.lambda_corr   # when the ladder is not configured
             if self.lambda_corr_fast is not None:
                 # Score-driven memory: stress days (w_t → 1) shorten the memory
                 # toward lambda_corr_fast; calm days keep the slow decay.
@@ -490,23 +556,28 @@ class SqueezeKernelEstimator:
                 # Q <- (1 - eta) Q + eta zz'. With w_t = 0 both S and M decay
                 # by lam_c, so Q is unchanged — no matrix work at all.
                 eta = w_t / self._S_t
-                self._Q_t *= 1.0 - eta
+                Q_t *= 1.0 - eta
                 self._scratch_outer *= eta
-                self._Q_t += self._scratch_outer
+                Q_t += self._scratch_outer
         else:
             # ── Scale-free ladder (Mode A) ──
             # Update K normalised correlation states on the geometric
             # half-life ladder; extraction (normalise + shrink + blend)
             # happens lazily in _materialize().
+            Q_list = self._Q_list
+            S_list = self._S_list
+            corr_w = self._corr_w
+            assert Q_list is not None and S_list is not None
+            assert corr_w is not None  # allocated together with corr_lam
             s_eff = 0.0
-            for k in range(self._corr_lam.size):
-                self._S_list[k] = self._corr_lam[k] * self._S_list[k] + w_t
+            for k in range(corr_lam.size):
+                S_list[k] = corr_lam[k] * S_list[k] + w_t
                 if add:
-                    eta = w_t / self._S_list[k]
-                    self._Q_list[k] *= 1.0 - eta
+                    eta = w_t / S_list[k]
+                    Q_list[k] *= 1.0 - eta
                     np.multiply(self._scratch_outer, eta, out=self._scratch_had)
-                    self._Q_list[k] += self._scratch_had
-                s_eff += self._corr_w[k] * self._S_list[k]
+                    Q_list[k] += self._scratch_had
+                s_eff += corr_w[k] * S_list[k]
             self._S_t = s_eff                        # blended effective size (for the property)
         self._vol_t = vol_t
         self._dirty = True
@@ -521,7 +592,9 @@ class SqueezeKernelEstimator:
             raise RuntimeError("Call update() at least once before get_cov().")
         if self._dirty:
             self._materialize()
-        return self._cov.copy()
+        cov = self._cov
+        assert cov is not None
+        return cov.copy()
 
     def get_corr(self) -> np.ndarray:
         """Return the current correlation matrix estimate (n x n)."""
@@ -529,7 +602,9 @@ class SqueezeKernelEstimator:
             raise RuntimeError("Call update() at least once before get_corr().")
         if self._dirty:
             self._materialize()
-        return self._corr.copy()
+        corr = self._corr
+        assert corr is not None
+        return corr.copy()
 
     @property
     def weight(self) -> float:
@@ -562,7 +637,7 @@ class SqueezeKernelEstimator:
 
     @staticmethod
     def calibrate_kappa(
-        returns, target_weight: float = 0.5, lambda_vol: float = 0.98,
+        returns: ArrayLike, target_weight: float = 0.5, lambda_vol: float = 0.98,
     ) -> float:
         """Calibrate κ from burn-in data so E[w_t] ≈ target_weight.
 
@@ -669,20 +744,24 @@ class SqueezeKernelEstimator:
         """Adaptive-weight extraction: build per-rung shrunk covariances
         (kept for the next update's detector scores), blend with the
         CUSUM-tilted weights, derive _cov/_corr. Runs eagerly."""
-        eps = self.epsilon
+        detector = self._detector
+        corr_lam = self._corr_lam
+        Q_list = self._Q_list
+        S_list = self._S_list
+        corr_w = self._corr_w
         vol_t = self._vol_t
+        assert detector is not None      # only called when the detector exists
+        assert corr_lam is not None and Q_list is not None
+        assert S_list is not None and corr_w is not None
+        assert vol_t is not None         # set on every update before this runs
+        eps = self.epsilon
         vv = np.multiply.outer(vol_t, vol_t)
         sig_k = []
-        for k in range(self._corr_lam.size):
-            corr_k = self._shrunk_corr_from_Q(self._Q_list[k], self._S_list[k])
+        for k in range(corr_lam.size):
+            corr_k = self._shrunk_corr_from_Q(Q_list[k], S_list[k])
             sig_k.append(corr_k * vv)
-        self._aw_prev_sig = sig_k
-        t = self._aw_tilt
-        pi = self._corr_w
-        if t >= 0:
-            w = (1.0 - t) * pi + t * self._aw_pi_fast
-        else:
-            w = (1.0 + t) * pi + (-t) * self._aw_pi_slow
+        detector.record(sig_k)
+        w = detector.blend(corr_w)
         cov = w[0] * sig_k[0]
         for k in range(1, len(sig_k)):
             cov = cov + w[k] * sig_k[k]
@@ -697,9 +776,12 @@ class SqueezeKernelEstimator:
         """Extract _cov/_corr from the current state (lazy, on demand)."""
         eps = self.epsilon
         vol_t = self._vol_t
+        assert vol_t is not None   # get_cov/get_corr guard this before calling
         if self._corr_lam is None:
             # ── Single scale: shrunk correlation IS the correlation output ──
-            corr = self._shrunk_corr_from_Q(self._Q_t, self._S_t)
+            Q_t = self._Q_t
+            assert Q_t is not None   # the ladder is not configured on this path
+            corr = self._shrunk_corr_from_Q(Q_t, self._S_t)
             np.multiply.outer(vol_t, vol_t, out=self._scratch_outer)
             cov = corr * self._scratch_outer
             cov += cov.T
@@ -712,10 +794,16 @@ class SqueezeKernelEstimator:
             # ── Ladder: blend per-rung shrunk correlations, then apply the
             # (shared) volatilities once — algebraically identical to
             # blending per-rung covariances, K-1 fewer O(n^2) passes.
+            corr_lam = self._corr_lam
+            Q_list = self._Q_list
+            S_list = self._S_list
+            corr_w = self._corr_w
+            assert Q_list is not None and S_list is not None
+            assert corr_w is not None  # allocated together with corr_lam
             mix = np.zeros((self.n_assets, self.n_assets), dtype=np.float64)
-            for k in range(self._corr_lam.size):
-                corr_k = self._shrunk_corr_from_Q(self._Q_list[k], self._S_list[k])
-                corr_k *= self._corr_w[k]
+            for k in range(corr_lam.size):
+                corr_k = self._shrunk_corr_from_Q(Q_list[k], S_list[k])
+                corr_k *= corr_w[k]
                 mix += corr_k
             cov = mix
             np.multiply.outer(vol_t, vol_t, out=self._scratch_outer)
@@ -751,7 +839,13 @@ def _resolve_kernel(
     if "kappa" in kw and kappa is not None:
         raise ValueError("Pass kappa either as a top-level argument or in kernel_kwargs, not both.")
 
-    resolved_kappa = float(kw.get("kappa", 0.25 if kappa is None else kappa))
+    if "kappa" in kw:
+        kappa_src = kw["kappa"]
+        if isinstance(kappa_src, bool) or not isinstance(kappa_src, (int, float)):
+            raise ValueError("kappa in kernel_kwargs must be a number.")
+        resolved_kappa = float(kappa_src)
+    else:
+        resolved_kappa = 0.25 if kappa is None else float(kappa)
     if resolved_kappa <= 0.0:
         raise ValueError("kappa must be > 0.")
     kw["kappa"] = resolved_kappa

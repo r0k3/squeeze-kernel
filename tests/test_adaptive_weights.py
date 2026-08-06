@@ -23,8 +23,9 @@ class TestAdaptiveWeights:
         assert est._adaptive
         for r in returns_medium:
             est.update(r)
-        assert est._aw_prev_sig is not None
-        assert len(est._aw_prev_sig) == len(LADDER)
+        assert est._detector is not None
+        assert est._detector.prev_sig is not None
+        assert len(est._detector.prev_sig) == len(LADDER)
 
     def test_psd_and_unit_diag(self, returns_medium):
         est = SqueezeKernelEstimator(30, corr_half_lives=LADDER,
@@ -41,11 +42,11 @@ class TestAdaptiveWeights:
         x = rng.normal(0, 0.01, size=(120, 8))
         a = SqueezeKernelEstimator(8, corr_half_lives=LADDER)
         b = SqueezeKernelEstimator(8, corr_half_lives=LADDER)
-        b._aw_b = float("inf")          # detector can never alarm
+        b._detector._THRESHOLD = float("inf")   # detector can never alarm
         for r in x:
             a.update(r)
             b.update(r)
-            if a._aw_tilt == 0.0:
+            if a._detector.tilt == 0.0:
                 np.testing.assert_allclose(a.get_cov(), b.get_cov(),
                                            rtol=1e-12, atol=0)
 
@@ -55,10 +56,10 @@ class TestAdaptiveWeights:
         est = SqueezeKernelEstimator(8, corr_half_lives=LADDER)
         for r in x:
             est.update(r)
-        est._aw_tilt = 0.5
+        est._detector.tilt = 0.5
         est._materialize_adaptive()
         cov_tilted = est.get_cov()
-        est._aw_tilt = 0.0
+        est._detector.tilt = 0.0
         est._materialize_adaptive()
         cov_prior = est.get_cov()
         assert not np.allclose(cov_tilted, cov_prior)
@@ -81,11 +82,13 @@ class TestAdaptiveWeights:
         a = SqueezeKernelEstimator(12, corr_half_lives=LADDER)
         for r in x:
             a.update(r)
-        cov_scipy, state_scipy = a.get_cov(), (a._aw_gp, a._aw_gm, a._aw_tilt)
+        cov_scipy = a.get_cov()
+        state_scipy = (a._detector.gp, a._detector.gm, a._detector.tilt)
         monkeypatch.setattr(mod, "_cho_factor", None)
         b = SqueezeKernelEstimator(12, corr_half_lives=LADDER)
         for r in x:
             b.update(r)
         np.testing.assert_allclose(b.get_cov(), cov_scipy, rtol=1e-9, atol=0)
         np.testing.assert_allclose(
-            (b._aw_gp, b._aw_gm, b._aw_tilt), state_scipy, rtol=1e-9, atol=1e-12)
+            (b._detector.gp, b._detector.gm, b._detector.tilt),
+            state_scipy, rtol=1e-9, atol=1e-12)

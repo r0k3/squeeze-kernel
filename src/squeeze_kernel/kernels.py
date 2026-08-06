@@ -5,10 +5,13 @@ from __future__ import annotations
 import math
 from typing import Callable
 
+import numpy as np
+from numpy.typing import ArrayLike
+
 KernelFn = Callable[..., float]
 
 
-def kernel_fisher(d2: float, /, *, kappa: float, **kw) -> float:
+def kernel_fisher(d2: float, /, *, kappa: float, **kw: object) -> float:
     """Fisher information saturation kernel: w = d² / (d² + κ).
 
     Motivated by the signal-to-noise structure of the Gaussian score.
@@ -19,14 +22,14 @@ def kernel_fisher(d2: float, /, *, kappa: float, **kw) -> float:
     return d2 / (d2 + kappa)
 
 
-def kernel_exponential(d2: float, /, *, gamma: float, **kw) -> float:
+def kernel_exponential(d2: float, /, *, gamma: float, **kw: object) -> float:
     """Rayleigh survival (exponential) kernel: w = 1 − exp(−d²/(2γ²))."""
     if gamma <= 0.0:
         raise ValueError("gamma must be > 0.")
     return 1.0 - math.exp(-d2 / (2.0 * gamma * gamma))
 
 
-def kernel_chi2_cdf(d2: float, /, *, n_observed: int, **kw) -> float:
+def kernel_chi2_cdf(d2: float, /, *, n_observed: int, **kw: object) -> float:
     """Chi-squared CDF kernel: w = F_χ²_N(N·d²).  Requires scipy."""
     try:
         from scipy.stats import chi2
@@ -38,7 +41,7 @@ def kernel_chi2_cdf(d2: float, /, *, n_observed: int, **kw) -> float:
     return float(chi2.cdf(n_observed * d2, df=n_observed))
 
 
-def calibrate_kappa(d2_samples, target_mean_weight: float = 0.5) -> float:
+def calibrate_kappa(d2_samples: ArrayLike, target_mean_weight: float = 0.5) -> float:
     """Find κ such that E[d²/(d²+κ)] ≈ target_mean_weight on burn-in data.
 
     This implements the closed-form initializer from Proposition 1 of the paper,
@@ -56,7 +59,6 @@ def calibrate_kappa(d2_samples, target_mean_weight: float = 0.5) -> float:
     float
         Calibrated κ value.
     """
-    import numpy as np
     try:
         from scipy.optimize import brentq
     except ImportError as exc:
@@ -75,7 +77,7 @@ def calibrate_kappa(d2_samples, target_mean_weight: float = 0.5) -> float:
     kappa_init = mu * (1.0 / target_mean_weight - 1.0)
 
     # Refine via root finding
-    def residual(kappa):
+    def residual(kappa: float) -> float:
         return float(np.mean(d2 / (d2 + kappa))) - target_mean_weight
 
     lo = max(kappa_init * 0.01, 1e-6)
@@ -90,8 +92,8 @@ def calibrate_kappa(d2_samples, target_mean_weight: float = 0.5) -> float:
 
 
 def extract_d2_series(
-    returns, lambda_vol: float = 0.98, epsilon: float = 1e-8,
-):
+    returns: ArrayLike, lambda_vol: float = 0.98, epsilon: float = 1e-8,
+) -> np.ndarray:
     """Extract the d̄²_t series from a returns panel for κ calibration.
 
     Parameters
@@ -106,7 +108,6 @@ def extract_d2_series(
     ndarray, shape (T,)
         Average squared standardized return at each timestep.
     """
-    import numpy as np
 
     x = np.asarray(returns, dtype=np.float64)
     t_total, n = x.shape

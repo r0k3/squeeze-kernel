@@ -141,6 +141,7 @@ The complete update is a natural-gradient step on the Gaussian log-likelihood, w
 uv sync --extra full --extra dev
 uv run python -m pytest        # test suite
 uv run python -m ruff check .  # lint
+uv run mypy                      # strict type check (src/squeeze_kernel)
 uv build                       # build sdist + wheel
 ```
 

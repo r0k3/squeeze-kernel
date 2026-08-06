@@ -32,7 +32,15 @@ Issues = "https://github.com/r0k3/squeeze-kernel/issues"
 
 [project.optional-dependencies]
 full = ["scipy>=1.11"]
-dev = ["pytest>=7.0", "ruff>=0.7", "scipy>=1.11"]
+dev = ["pytest>=7.0", "ruff>=0.7", "scipy>=1.11", "mypy>=1.10"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.mypy]
+files = ["src/squeeze_kernel"]
+strict = true
+
+[[tool.mypy.overrides]]
+module = "scipy.*"
+ignore_missing_imports = true

@@ -66,6 +66,29 @@ class TestBatchConsistency:
         )
         assert np.allclose(cov_ref, cov_batch, atol=1e-12)
 
+    def test_batch_reaches_ladder_extension(self, returns_small):
+        """Kwargs forward to the estimator: the scale-free ladder is
+        reachable from batch mode and matches the streaming path."""
+        n = returns_small.shape[1]
+        hl = (20.0, 60.0, 180.0)
+        est = SqueezeKernelEstimator(n, corr_half_lives=hl, corr_theta=0.25)
+        cov_ref = np.empty((len(returns_small), n, n))
+        for t in range(len(returns_small)):
+            est.update(returns_small[t])
+            cov_ref[t] = est.get_cov()
+
+        cov_batch, _, _ = estimate_squeeze_cov(
+            returns_small, corr_half_lives=hl, corr_theta=0.25,
+            with_corr=False,
+        )
+        np.testing.assert_allclose(cov_ref, cov_batch, rtol=1e-12, atol=0)
+
+    def test_batch_reaches_shrinkage_target(self, returns_small):
+        cov, _, _ = estimate_squeeze_cov(
+            returns_small, shrinkage_target="cluster", with_corr=False,
+        )
+        assert np.isfinite(cov).all()
+
 
 class TestBatchValidation:
     def test_1d_raises(self):
@@ -75,3 +98,9 @@ class TestBatchValidation:
     def test_3d_raises(self):
         with pytest.raises(ValueError, match="2D"):
             estimate_squeeze_cov(np.zeros((10, 5, 3)), kappa=1.5)
+
+    def test_explicit_n_assets_raises(self):
+        with pytest.raises(ValueError, match="n_assets"):
+            estimate_squeeze_cov(np.zeros((10, 5)), n_assets=5)
+
+

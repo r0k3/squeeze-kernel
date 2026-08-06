@@ -16,6 +16,7 @@ Please run the full local checks before opening a pull request:
 
 ```bash
 uv run python -m ruff check .
+uv run mypy
 uv run python -m pytest
 uv build
 ```
