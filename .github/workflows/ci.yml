@@ -34,6 +34,9 @@ jobs:
         run: uv run python -m ruff check .
 
       - name: Type check
+        # numpy stubs on 3.10 (numpy 2.2, last to support it) lack the default
+        # type parameters for ndarray that strict mode relies on; check on 3.13.
+        if: matrix.python-version == '3.13'
         run: uv run mypy
 
       - name: Run tests
