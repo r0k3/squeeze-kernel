@@ -5,13 +5,13 @@
 [![Python](https://img.shields.io/pypi/pyversions/squeeze-kernel.svg)](https://pypi.org/project/squeeze-kernel/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-A **streaming covariance estimator for panels of daily financial returns**. One `O(n²)` update per day, positive semi-definite **by construction** at every step, missing values handled **natively**, and defaults that require no tuning. Only dependency: NumPy.
+A **streaming covariance estimator for panels of financial returns** that learns fastest on the days that matter. One `O(n²)` update per period, positive semi-definite **by construction** at every step, missing values handled **natively**, and defaults that require no tuning. Only dependency: NumPy.
 
-Reference: *"The Squeeze Kernel Covariance Estimator: Dual-Timescale Tracking with Adaptive Shrinkage"* (Kende, 2026) — [SSRN abstract 6455918](https://ssrn.com/abstract=6455918).
+References: *"The Squeeze Kernel Covariance Estimator: Dual-Timescale Tracking with Adaptive Shrinkage"* (Kende, 2026) — [SSRN abstract 6455918](https://ssrn.com/abstract=6455918) — and its companion *"Cluster-Respecting Shrinkage for Streaming Covariance Estimation"* (Kende, 2026).
 
 ## Why
 
-Rolling-window estimators (Ledoit–Wolf, nonlinear shrinkage, RMT denoising) refit over a fixed window each day and cannot adapt within it; multivariate GARCH (DCC) adapts but needs multi-stage estimation and a fragile news coefficient. The Squeeze Kernel is a single streaming recursion that:
+Every standard covariance estimator treats all trading days as equally informative. Markets don't work that way: **correlations reveal themselves when markets move; calm days are mostly noise.** The Squeeze Kernel weighs each day by the information it actually carries — quiet days barely count, dispersion shocks pass through in full — and runs volatility and correlation on separate clocks, so vol spikes never contaminate the correlation estimate. The result is a single streaming recursion that:
 
 - **is PSD at every step, structurally** — never needs eigenvalue clipping, nearest-PSD projection, or a solver;
 - **adapts fastest exactly when it matters** — a Fisher-information kernel up-weights high-dispersion (stress) days, when correlation regimes actually move;
@@ -19,7 +19,37 @@ Rolling-window estimators (Ledoit–Wolf, nonlinear shrinkage, RMT denoising) re
 - **ingests missing values natively** — listings, delistings, and halts enter as `NaN`; no imputation or complete-case subsetting;
 - **is fast** — a full 30-year daily pass takes ~0.75 s at n=100 and ~3.4 s at n=300 (single-threaded), 30–40× faster than rolling-window baselines at scale.
 
-On a 30-year S&P 500 panel (n=100, ~7,600 out-of-sample days) it statistically ties DCC on one-step density forecasts and beats EWMA, Ledoit–Wolf, OAS, nonlinear shrinkage, RMT denoising, and the Gerber statistic — and it is the only method in the 90% model confidence set together with DCC. At n=300 it leads every competitor that remains statistically viable.
+**The scoreboard.** On a 30-year S&P 500 panel (~7,600 out-of-sample days) the default single-scale estimator beats EWMA, Ledoit–Wolf, OAS, nonlinear shrinkage, RMT denoising, and the Gerber statistic on one-step density forecasts, and statistically ties DCC — the only two methods in the 90% model confidence set. The headline configuration (multi-scale correlation memory, `corr_half_lives=(43, 173, 693)`) goes further: it **leads every tested method at every universe size and the 90% model confidence set collapses to it alone**, with the margin confirmed out-of-time on an external industry panel. For large equity universes, the cluster shrinkage target (`shrinkage_target="cluster"`) adds a further large gain exactly where shrinkage binds: 25 NLL points at n=300.
+
+Against the alternatives:
+
+- **RiskMetrics / EWMA** — same one-recursion simplicity, but two clocks and information weighting: better forecasts at zero extra operational cost.
+- **Ledoit–Wolf, nonlinear shrinkage, RMT denoising** — static snapshots refit from scratch on a rolling window each day; the Squeeze Kernel is genuinely dynamic, more accurate on the benchmark, and 30–40× faster at scale.
+- **DCC-GARCH** — matched (single-scale) or beaten (multi-scale) without multi-stage likelihood fitting or the fragile news-impact coefficient; at n=300 DCC needs a multi-year warm-up before its forecasts stabilise and still trails by ~25 NLL.
+- **Gerber statistic** — the Squeeze Kernel is a PSD-by-construction generalization of the same robust-comovement idea: no nearest-PSD repair step, and it wins the head-to-head.
+
+## See the difference
+
+Take a passive strategy any allocator would recognize: a long-only minimum-variance portfolio of 300 liquid US stocks, scaled to a 15% volatility target, rebalanced once a month, with 5 bps trading costs. Run it twice on identical data. The only thing that changes between the two runs is the covariance matrix that picks the weights and sets the exposure.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="examples/figures/vol_targeted_portfolio_dark.png">
+  <img alt="Vol-targeted long-only minimum-variance portfolio on 300 US equities: Squeeze Kernel vs Ledoit-Wolf equity curves, drawdown, realized volatility, and risk/return profile" src="examples/figures/vol_targeted_portfolio.png">
+</picture>
+
+| Method | CAGR | Vol | Sharpe | MaxDD | Calmar | Vol-target RMSE |
+|---|---|---|---|---|---|---|
+| **Squeeze Kernel** | **13.1%** | **13.0%** | **1.00** | **-31.2%** | **0.42** | **6.47%** |
+| Ledoit-Wolf (252d) | 11.7% | 14.6% | 0.80 | -38.7% | 0.30 | 7.51% |
+
+You can regenerate this example from the repo alone. The returns panel ships as a parquet (daily returns for 300 US stocks, sourced from Yahoo Finance), and the script prints the table and redraws the figure:
+
+```bash
+pip install squeeze-kernel pandas pyarrow scikit-learn matplotlib
+python examples/vol_targeted_portfolio.py    # ~2 minutes
+```
+
+The full protocol and data notes live in [`examples/vol_targeted_portfolio.py`](examples/vol_targeted_portfolio.py) and [`examples/data/build_equity_panel.py`](examples/data/build_equity_panel.py).
 
 ## Installation
 
@@ -86,44 +116,27 @@ kappa = SqueezeKernelEstimator.calibrate_kappa(burn_in_returns, target_weight=0.
 
 ## Advanced options
 
-**Adaptive scale-free correlation memory** (`corr_half_lives=(43, 173, 693)`, `corr_theta=0.25`): replaces the single correlation timescale with a positive combination of EWMAs on a geometric half-life ladder — each scale normalized and adaptively shrunk against its own effective sample size, then the covariances blended with weights resting at the prior ∝ half-life^`corr_theta`. By Bernstein's theorem the ladder approximates the power-law memory of financial correlations (the streaming analogue of HAR). For ladders of two or more rungs the blend weights are gated by a sequential surprise detector: a two-sided Page CUSUM on the studentized fast-vs-slow per-rung predictive-score drift (threshold set by Siegmund's average-run-length approximation at ~2 years, no tuned parameters) tilts the weights toward the fast or slow end of the ladder when one side accumulates statistically forced evidence, decaying back at the fastest rung's half-life. Weights equal the prior on all non-alarmed days, the blend stays convex, so PSD holds by construction; `None` (default) reproduces the published single-scale estimator exactly. This is the paper's **headline configuration**: on the S&P 500 benchmark it leads every tested method at every universe size (held-out one-step NLL −4.6 vs single-scale at n=100, −11.1 at n=300 before the cluster target), the 90% model confidence set collapses to it alone, and the detector's margin is confirmed out-of-time on an external industry panel (+0.53 NLL/day, p=1×10⁻⁴). Cost is O(K·n²) per update plus one Cholesky per rung per day for the detector scores. Composes with `shrinkage_target="cluster"`; mutually exclusive with `lambda_corr_fast`.
+All options are off by default; the defaults reproduce the published estimator exactly. Full derivations and benchmark tables are in the papers.
+
+**Multi-scale correlation memory** (`corr_half_lives=(43, 173, 693)`): replaces the single correlation timescale with a ladder of EWMAs whose blend a sequential surprise detector tilts toward fast or slow memory as the evidence demands. This is the papers' headline configuration: it leads every tested method at every universe size, and the blend stays convex so PSD still holds by construction.
+
+**Cluster shrinkage target** (`shrinkage_target="cluster"`): shrinks toward a target that respects the correlation matrix's own block structure instead of a single equicorrelation, with no clustering algorithm and zero added parameters. The best choice for large equity universes: worth 4 held-out NLL points at n=200 and 25 at n=300 on the benchmark.
 
 ```python
-est = SqueezeKernelEstimator(n_assets=100, corr_half_lives=(43, 173, 693), corr_theta=0.25)
-# maximal variant at high dimension:
-est = SqueezeKernelEstimator(n_assets=300, corr_half_lives=(43, 173, 693), shrinkage_target="cluster")
+# recommended setup for a large equity universe:
+est = SqueezeKernelEstimator(n_assets=300, corr_half_lives=(43, 173, 693),
+                             shrinkage_target="cluster")
 ```
 
-**Score-exact weighting** (`weight_statistic="mahalanobis"`, use with `kappa=1.0`): drives the kernel with the Mahalanobis surprise `z'C⁻¹z/N` against the estimator's own correlation instead of the marginal dispersion. Improves accuracy in the moderate-concentration regime — use only when `n / T_eff ≲ 0.5` (e.g. n ≤ 100 at the default `lambda_corr`); at higher concentration the estimated inverse degrades it and the default is strictly better.
+**OU volatility anchor** (`vol_anchor_phi=0.995`): mean-reverts each asset's variance forecast toward a slow per-asset anchor, giving a two-timescale volatility structure with a single parameter (deviation half-life ≈ ln 2/(1−φ) days). Worth 3–5 NLL points on the benchmark.
 
-```python
-est = SqueezeKernelEstimator(n_assets=100, kappa=1.0, weight_statistic="mahalanobis")
-```
+**Score-exact weighting** (`weight_statistic="mahalanobis"`, use with `kappa=1.0`): drives the kernel with the Mahalanobis surprise against the estimator's own correlation. Use it only in the moderate-concentration regime (`n / T_eff ≲ 0.5`).
 
-**Score-driven memory** (`lambda_corr_fast=0.99`): lets stress days also *shorten* the correlation memory (decay slides from `lambda_corr` toward `lambda_corr_fast` as the kernel weight rises). Do **not** combine with the Mahalanobis option — they act on the same channel and the combination degrades accuracy.
+**Score-driven memory** (`lambda_corr_fast=0.99`): lets stress days also shorten the correlation memory. Do not combine with the Mahalanobis option.
 
-**OU volatility anchor** (`vol_anchor_phi=0.995`): mean-reverts each asset's variance prediction toward a slow per-asset anchor (a ~1000-day EWMA of squared returns) before the daily update — a two-timescale, component-style volatility structure. One global parameter with a clean interpretation (deviation half-life ≈ ln 2/(1−φ) days; φ=0.995 ≈ 139 d). On the S&P 500 n=100 benchmark this improved held-out one-step NLL by 3.3 points (4.3 at φ=0.99) and five-step NLL by 3.9 (5.0), with no degradation at n=300. `None` (default) or φ=1 reproduces the published estimator exactly.
+**New-listing usability gate** (`min_obs=60`): exposes a `usable_mask` property marking assets with at least `min_obs` observations, so deployments can exclude cold starts from scoring and optimization; the estimates themselves are unchanged.
 
-```python
-est = SqueezeKernelEstimator(n_assets=100, vol_anchor_phi=0.995)
-```
-
-**Cluster shrinkage target** (`shrinkage_target="cluster"`): generalizes the equicorrelation shrinkage target to respect the correlation matrix's own block/cluster structure — with **no clustering algorithm**. The target morphs with the shrinkage intensity, T = (1−α)·T_equi + α·[(1−γ)I + γ·(C∘C)], where C∘C is the Hadamard square of the current correlation (positive semi-definite by the Schur product theorem; entries are pairwise shared-variance fractions) and γ is level-matched automatically. Zero added parameters, still O(n²), and as α→0 it reduces exactly to the default estimator. Held-out one-step NLL on the S&P 500 benchmark: ±0.1 at n=100, **−4.2 at n=200, −25.0 at n=300** — recommended whenever the universe size approaches the effective sample size.
-
-```python
-est = SqueezeKernelEstimator(n_assets=300, shrinkage_target="cluster")
-```
-
-**New-listing usability gate** (`min_obs=60`): on an expanding universe, an asset's forecast rows are dominated by its single-observation variance initialization for its first weeks of life and are unusable for scoring or portfolio construction (measured ≈ +2,800 NLL/day on days whose scored set included such assets, on a 42-instrument multi-asset panel). `min_obs` gates nothing inside the estimator — states warm normally, all outputs are unchanged — it exposes a `usable_mask` property marking assets with at least `min_obs` finite observations, so deployments subset with it:
-
-```python
-est = SqueezeKernelEstimator(n_assets=42, min_obs=60)
-# ... update loop ...
-m = est.usable_mask
-cov_usable = est.get_cov()[np.ix_(m, m)]
-```
-
-**Alternative kernels**: pass `kernel_fn=kernel_exponential` (with `kernel_kwargs={"gamma": ...}`) or `kernel_chi2_cdf`, or any callable `(d2, *, n_observed, **kw) -> float` mapping to `[0, 1)`. The PSD guarantee holds for any such kernel.
+**Alternative kernels**: pass `kernel_fn=kernel_exponential` or `kernel_chi2_cdf`, or any callable mapping to `[0, 1)`; the PSD guarantee holds for any such kernel.
 
 ## How it works
 
@@ -144,8 +157,6 @@ uv run python -m ruff check .  # lint
 uv run mypy                      # strict type check (src/squeeze_kernel)
 uv build                       # build sdist + wheel
 ```
-
-Releases: publishing a GitHub release from a `v*` tag triggers the [publish workflow](.github/workflows/publish.yml), which builds and uploads to PyPI via trusted publishing.
 
 ## Citation
 
