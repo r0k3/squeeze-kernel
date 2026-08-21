@@ -33,8 +33,8 @@ Against the alternatives:
 Take a passive strategy any allocator would recognize: a long-only minimum-variance portfolio of 300 liquid US stocks, scaled to a 15% volatility target, rebalanced once a month, with 5 bps trading costs. Run it twice on identical data. The only thing that changes between the two runs is the covariance matrix that picks the weights and sets the exposure.
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="examples/figures/vol_targeted_portfolio_dark.png">
-  <img alt="Vol-targeted long-only minimum-variance portfolio on 300 US equities: Squeeze Kernel vs Ledoit-Wolf equity curves, drawdown, realized volatility, and risk/return profile" src="examples/figures/vol_targeted_portfolio.png">
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/r0k3/squeeze-kernel/main/examples/figures/vol_targeted_portfolio_dark.png">
+  <img alt="Vol-targeted long-only minimum-variance portfolio on 300 US equities: Squeeze Kernel vs Ledoit-Wolf equity curves, drawdown, realized volatility, and risk/return profile" src="https://raw.githubusercontent.com/r0k3/squeeze-kernel/main/examples/figures/vol_targeted_portfolio.png">
 </picture>
 
 | Method | CAGR | Vol | Sharpe | MaxDD | Calmar | Vol-target RMSE |

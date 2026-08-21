@@ -34,4 +34,4 @@ __all__ = [
     "kernel_chi2_cdf",
 ]
 
-__version__ = "0.7.0"
+__version__ = "0.7.1"
