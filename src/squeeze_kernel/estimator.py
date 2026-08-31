@@ -320,6 +320,10 @@ class SqueezeKernelEstimator:
         corr_half_lives: "Sequence[float] | None" = None,
         corr_theta: float = 0.25,
         min_obs: int | None = None,
+        kappa_mode: str = "fixed",
+        alpha_rule: str = "published",
+        level_match: bool = True,
+        detector: bool = True,
     ):
         self.n_assets = n_assets
         self.lambda_vol = lambda_vol
@@ -350,6 +354,26 @@ class SqueezeKernelEstimator:
         self.min_obs = min_obs
         self._obs_count = np.zeros(n_assets, dtype=np.int64)
 
+        # v2 self-tuning opt-ins (defaults preserve v1 bit-for-bit).
+        if kappa_mode not in ("fixed", "adaptive"):
+            raise ValueError("kappa_mode must be 'fixed' or 'adaptive'.")
+        if alpha_rule not in ("published", "selftuning"):
+            raise ValueError("alpha_rule must be 'published' or 'selftuning'.")
+        if (kappa_mode == "adaptive" or alpha_rule == "selftuning") \
+                and corr_half_lives is None:
+            raise ValueError(
+                "kappa_mode='adaptive' and alpha_rule='selftuning' require "
+                "the correlation ladder (corr_half_lives)."
+            )
+        self.kappa_mode = kappa_mode
+        self.alpha_rule = alpha_rule
+        self.level_match = level_match
+        self._kappa_c = 1.0 / 3.0          # chi-squared-null constant
+        self._kap_state = 1.0              # chi-squared null mean of d^2
+        self._kap_lam = 0.0                # set with the ladder below
+        self._J_list: list[float] | None = None
+        self._offmask_cache: np.ndarray | None = None
+
         # Scale-free correlation memory (opt-in): replace the single correlation
         # timescale by a positive combination of EWMAs on a geometric half-life
         # ladder, blended per-scale (Mode A). None => single-scale, published
@@ -379,9 +403,12 @@ class SqueezeKernelEstimator:
             self._corr_w = w / w.sum()
             self._Q_list = [np.eye(n_assets, dtype=np.float64) for _ in hl]
             self._S_list = [float(epsilon) for _ in hl]
+            self._J_list = [float(epsilon) for _ in hl]
+            self._kap_lam = 2.0 ** (-1.0 / float(np.median(hl)))
             # Surprise-gated blend weights (integral for K >= 2): see
-            # ``_SurpriseDetector``.
-            self._adaptive = hl.size >= 2
+            # ``_SurpriseDetector``. ``detector=False`` opts out (theta-prior
+            # weights; the v2 ablation switch).
+            self._adaptive = detector and hl.size >= 2
             if self._adaptive:
                 self._detector = _SurpriseDetector(hl)
 
@@ -513,7 +540,15 @@ class SqueezeKernelEstimator:
         if n_obs > 0:
             z_t[finite] = r_t[finite] / (vol_t[finite] + eps)
             d2 = float(z_t[finite] @ z_t[finite]) / n_obs
-            if self.weight_statistic == "mahalanobis" and self._vol_t is not None:
+            if self.kappa_mode == "adaptive":
+                # kappa_t = c * EWMA_h(d^2): state, not parameter. Today's
+                # weight uses the state BEFORE absorbing today's d^2.
+                kappa_t = self._kappa_c * self._kap_state
+                self._kap_state = (self._kap_lam * self._kap_state
+                                   + (1.0 - self._kap_lam) * d2)
+                w_t = d2 / (d2 + kappa_t)
+                self._last_kappa = kappa_t
+            elif self.weight_statistic == "mahalanobis" and self._vol_t is not None:
                 # Score-exact surprise against the estimator's own previous
                 # correlation; falls back to the marginal d² on the first
                 # step or a (rare) singular observed submatrix. Extraction is
@@ -527,7 +562,9 @@ class SqueezeKernelEstimator:
                     d2 = float(z_t[finite] @ np.linalg.solve(c_sub, z_t[finite])) / n_obs
                 except np.linalg.LinAlgError:
                     pass
-            w_t = self._kernel_fn(d2, n_observed=n_obs, **self._kernel_kwargs)
+                w_t = self._kernel_fn(d2, n_observed=n_obs, **self._kernel_kwargs)
+            else:
+                w_t = self._kernel_fn(d2, n_observed=n_obs, **self._kernel_kwargs)
         else:
             w_t = 0.0
 
@@ -569,9 +606,12 @@ class SqueezeKernelEstimator:
             corr_w = self._corr_w
             assert Q_list is not None and S_list is not None
             assert corr_w is not None  # allocated together with corr_lam
+            J_list = self._J_list
+            assert J_list is not None
             s_eff = 0.0
             for k in range(corr_lam.size):
                 S_list[k] = corr_lam[k] * S_list[k] + w_t
+                J_list[k] = corr_lam[k] * corr_lam[k] * J_list[k] + w_t
                 if add:
                     eta = w_t / S_list[k]
                     Q_list[k] *= 1.0 - eta
@@ -686,7 +726,8 @@ class SqueezeKernelEstimator:
             if den > 0.0:
                 z_t[i] = num / den
 
-    def _shrunk_corr_from_Q(self, Q: np.ndarray, S_t: float) -> np.ndarray:
+    def _shrunk_corr_from_Q(self, Q: np.ndarray, S_t: float,
+                            J_t: float | None = None) -> np.ndarray:
         """Normalise one Q state to a correlation and shrink it in place.
 
         Returns ``self._scratch_corr`` — valid only until the next call.
@@ -710,7 +751,28 @@ class SqueezeKernelEstimator:
         # the diagonal to 1.
         alpha = self._shrinkage_alpha
         if alpha < 0:
-            alpha = max(0.0, min(1.0, n / (2.0 * S_t) - self.shrinkage_delta))
+            if self.alpha_rule == "selftuning" and J_t is not None:
+                # v2 self-tuning intensity (WP7): alpha from the online
+                # concentration c = n/nu (nu = S^2/J, fractional-info ESS)
+                # and the de-noised equicorrelation-explained fraction
+                # g = rho^2 / (mo - vhat):
+                #   alpha = min(1,c) * g^2 / (g^2 + (1-g)^2 max(0, 1/c - 1))
+                # Zero free constants; arithmetic mirrors the research
+                # engine entry-for-entry (offmask means).
+                if self._offmask_cache is None:
+                    self._offmask_cache = ~np.eye(n, dtype=bool)
+                off = corr[self._offmask_cache]
+                nu = S_t * S_t / max(J_t, eps)
+                c_k = n / max(nu, eps)
+                vhat = float(((1.0 - off * off) ** 2).mean()) / max(nu, eps)
+                mo_r = float((off * off).mean())
+                rho_r = float(off.mean())
+                gt = min(1.0, rho_r * rho_r / max(mo_r - vhat, 1e-6))
+                r_ = (1.0 - gt) / max(gt, 1e-6)
+                s_ = max(0.0, 1.0 / max(c_k, eps) - 1.0)
+                alpha = min(1.0, c_k) / (1.0 + r_ * r_ * s_)
+            else:
+                alpha = max(0.0, min(1.0, n / (2.0 * S_t) - self.shrinkage_delta))
         if alpha > 0.0 and n > 1:
             # Off-diagonal mean: O(n^2) sum, no mask allocation.
             rho_bar = (corr.sum() - corr.trace()) / self._n_off
@@ -731,8 +793,11 @@ class SqueezeKernelEstimator:
                 # alpha -> 0 this reduces exactly to the published estimator.
                 had = self._scratch_had
                 np.multiply(corr, corr, out=had)        # Hadamard square, O(n^2)
-                mean_off = (had.sum() - np.trace(had)) / self._n_off
-                gamma = min(1.0, rho_bar / max(mean_off, eps))
+                if self.level_match:
+                    mean_off = (had.sum() - np.trace(had)) / self._n_off
+                    gamma = min(1.0, rho_bar / max(mean_off, eps))
+                else:
+                    gamma = 1.0            # v2: pure Schur-square target
                 corr *= (1.0 - alpha)
                 corr += (alpha * (1.0 - alpha)) * rho_bar
                 had *= alpha * alpha * gamma
@@ -757,8 +822,10 @@ class SqueezeKernelEstimator:
         eps = self.epsilon
         vv = np.multiply.outer(vol_t, vol_t)
         sig_k = []
+        J_list = self._J_list
+        assert J_list is not None
         for k in range(corr_lam.size):
-            corr_k = self._shrunk_corr_from_Q(Q_list[k], S_list[k])
+            corr_k = self._shrunk_corr_from_Q(Q_list[k], S_list[k], J_list[k])
             sig_k.append(corr_k * vv)
         detector.record(sig_k)
         w = detector.blend(corr_w)
@@ -800,9 +867,12 @@ class SqueezeKernelEstimator:
             corr_w = self._corr_w
             assert Q_list is not None and S_list is not None
             assert corr_w is not None  # allocated together with corr_lam
+            J_list = self._J_list
+            assert J_list is not None
             mix = np.zeros((self.n_assets, self.n_assets), dtype=np.float64)
             for k in range(corr_lam.size):
-                corr_k = self._shrunk_corr_from_Q(Q_list[k], S_list[k])
+                corr_k = self._shrunk_corr_from_Q(Q_list[k], S_list[k],
+                                                  J_list[k])
                 corr_k *= corr_w[k]
                 mix += corr_k
             cov = mix

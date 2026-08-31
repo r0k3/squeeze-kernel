@@ -2,31 +2,37 @@
 Squeeze Kernel Covariance Estimator
 ====================================
 
-Streaming, PSD-by-construction covariance estimator with adaptive
-equicorrelation shrinkage and pluggable kernel weighting.
+Streaming, PSD-by-construction covariance estimator. The 2.0 API is one
+number and two booleans; everything else derives from the half-life or is
+a frozen structural constant.
 
 Quick start::
 
     import numpy as np
-    from squeeze_kernel import SqueezeKernelEstimator
+    from squeeze_kernel import SqueezeKernel
 
-    returns = np.random.default_rng(42).normal(0.0, 0.01, size=(250, 3))
+    returns = np.random.default_rng(42).normal(0.0, 0.01, size=(250, 30))
 
-    # Defaults (lambda_vol=0.98, lambda_corr=0.996, kappa=0.25) are the
-    # paper-recommended settings for panels of daily financial returns.
-    est = SqueezeKernelEstimator(n_assets=3)
+    sk = SqueezeKernel(half_life=173, detector=True, cluster_target=True)
     for r_t in returns:
-        est.update(r_t)
+        sk.update(r_t)          # NaN marks missing assets
 
-    cov = est.get_cov()
-    corr = est.get_corr()
+    cov = sk.covariance()
+    corr = sk.correlation()
+
+The published v1 estimator (all legacy knobs) remains available as
+``SqueezeKernelEstimator`` or ``SqueezeKernel.v1(...)``; see MIGRATION.md.
 """
 
+from squeeze_kernel.core import CONSTANTS, SqueezeKernel, StructuralConstants
 from squeeze_kernel.estimator import SqueezeKernelEstimator
 from squeeze_kernel.kernels import kernel_fisher, kernel_exponential, kernel_chi2_cdf
 from squeeze_kernel.batch import estimate_squeeze_cov
 
 __all__ = [
+    "SqueezeKernel",
+    "StructuralConstants",
+    "CONSTANTS",
     "SqueezeKernelEstimator",
     "estimate_squeeze_cov",
     "kernel_fisher",
@@ -34,4 +40,4 @@ __all__ = [
     "kernel_chi2_cdf",
 ]
 
-__version__ = "0.7.1"
+__version__ = "2.0.0.dev0"

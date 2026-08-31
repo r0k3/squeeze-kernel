@@ -9,6 +9,27 @@ A **streaming covariance estimator for panels of financial returns** that learns
 
 References: *"The Squeeze Kernel Covariance Estimator: Dual-Timescale Tracking with Adaptive Shrinkage"* (Kende, 2026) — [SSRN abstract 6455918](https://ssrn.com/abstract=6455918) — and its companion *"Cluster-Respecting Shrinkage for Streaming Covariance Estimation"* (Kende, 2026).
 
+## 2.0: one number
+
+```python
+from squeeze_kernel import SqueezeKernel
+
+sk = SqueezeKernel(half_life=173, detector=True, cluster_target=True)
+for r_t in returns:              # NaN marks missing assets
+    sk.update(r_t)
+cov = sk.covariance()
+```
+
+Everything else is derived from the half-life or is a frozen structural
+constant — including the shrinkage intensity, which self-tunes per
+timescale from the online concentration `c = n/ν` and the de-noised
+factor-fit `g̃`: `α = min(1,c)·g̃²/(g̃²+(1−g̃)²·max(0,1/c−1))`. No δ, no κ,
+no θ to set; the kernel scale is state (`κ_t = ⅓·EWMA(d²)`). The
+published v1 estimator below remains available unchanged
+(`SqueezeKernelEstimator` / `SqueezeKernel.v1`); the mapping of every v1
+knob is in [MIGRATION.md](MIGRATION.md). The benchmark narrative below
+documents the published v1 configuration.
+
 ## Why
 
 Every standard covariance estimator treats all trading days as equally informative. Markets don't work that way: **correlations reveal themselves when markets move; calm days are mostly noise.** The Squeeze Kernel weighs each day by the information it actually carries — quiet days barely count, dispersion shocks pass through in full — and runs volatility and correlation on separate clocks, so vol spikes never contaminate the correlation estimate. The result is a single streaming recursion that:
