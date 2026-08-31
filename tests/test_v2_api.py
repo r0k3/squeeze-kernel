@@ -124,3 +124,27 @@ def test_defaults_do_not_touch_v1():
     for r in X:
         a.update(r); b.update(r)
     assert np.array_equal(a.get_cov(), b.get_cov())
+
+
+def test_selftuning_target_variant_runs_and_differs():
+    rng = np.random.default_rng(5)
+    # sign-symmetric block structure: the corner the target-family fit closes
+    n = 20
+    C = np.full((n, n), -0.15)
+    for b in range(4):
+        C[b*5:(b+1)*5, b*5:(b+1)*5] = 0.5
+    np.fill_diagonal(C, 1.0)
+    L = np.linalg.cholesky(C + 1e-10*np.eye(n))
+    X = (rng.standard_normal((400, n)) @ L.T) * 0.01
+    covs = {}
+    for rule in ("selftuning", "selftuning-target"):
+        est = SqueezeKernelEstimator(
+            n, lambda_vol=0.98, shrinkage="auto", shrinkage_target="cluster",
+            corr_half_lives=(43., 173., 693.), corr_theta=0.5,
+            kappa_mode="adaptive", alpha_rule=rule, level_match=False)
+        for r in X:
+            est.update(r)
+        covs[rule] = est.get_cov()
+    assert not np.allclose(covs["selftuning"], covs["selftuning-target"])
+    for c in covs.values():
+        assert np.linalg.eigvalsh(c).min() > -1e-10

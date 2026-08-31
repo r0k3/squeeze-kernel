@@ -357,8 +357,11 @@ class SqueezeKernelEstimator:
         # v2 self-tuning opt-ins (defaults preserve v1 bit-for-bit).
         if kappa_mode not in ("fixed", "adaptive"):
             raise ValueError("kappa_mode must be 'fixed' or 'adaptive'.")
-        if alpha_rule not in ("published", "selftuning"):
-            raise ValueError("alpha_rule must be 'published' or 'selftuning'.")
+        if alpha_rule not in ("published", "selftuning", "selftuning-target"):
+            raise ValueError(
+                "alpha_rule must be 'published', 'selftuning' or "
+                "'selftuning-target'."
+            )
         if (kappa_mode == "adaptive" or alpha_rule == "selftuning") \
                 and corr_half_lives is None:
             raise ValueError(
@@ -751,7 +754,7 @@ class SqueezeKernelEstimator:
         # the diagonal to 1.
         alpha = self._shrinkage_alpha
         if alpha < 0:
-            if self.alpha_rule == "selftuning" and J_t is not None:
+            if self.alpha_rule != "published" and J_t is not None:
                 # v2 self-tuning intensity (WP7): alpha from the online
                 # concentration c = n/nu (nu = S^2/J, fractional-info ESS)
                 # and the de-noised equicorrelation-explained fraction
@@ -767,7 +770,21 @@ class SqueezeKernelEstimator:
                 vhat = float(((1.0 - off * off) ** 2).mean()) / max(nu, eps)
                 mo_r = float((off * off).mean())
                 rho_r = float(off.mean())
-                gt = min(1.0, rho_r * rho_r / max(mo_r - vhat, 1e-6))
+                if self.alpha_rule == "selftuning-target":
+                    # Research variant (f7): gate by the target-family fit
+                    # R^2 of offdiag(C) on {1, C o C} = corr(x, x^2)^2 —
+                    # closes the strong-cluster/zero-mean-correlation corner
+                    # at a measured cost on dispersed signed panels (see the
+                    # papers' ablation); the shipped rule uses the market
+                    # fit below.
+                    m3 = float((off * off * off).mean())
+                    m4 = float((off ** 4).mean())
+                    varx = max(mo_r - rho_r * rho_r, 1e-12)
+                    vary = max(m4 - mo_r * mo_r, 1e-12)
+                    cov_xy = m3 - rho_r * mo_r
+                    gt = min(1.0, cov_xy * cov_xy / (varx * vary))
+                else:
+                    gt = min(1.0, rho_r * rho_r / max(mo_r - vhat, 1e-6))
                 r_ = (1.0 - gt) / max(gt, 1e-6)
                 s_ = max(0.0, 1.0 / max(c_k, eps) - 1.0)
                 alpha = min(1.0, c_k) / (1.0 + r_ * r_ * s_)
