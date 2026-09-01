@@ -8,7 +8,7 @@ golden tests still pin the published numbers bit-for-bit.
 ```python
 from squeeze_kernel import SqueezeKernel
 
-sk = SqueezeKernel(half_life=173)      # the entire public surface
+sk = SqueezeKernel(lam=0.996)          # the entire public surface
 for r_t in returns:                    # NaN marks missing assets
     sk.update(r_t)
 cov = sk.covariance()
@@ -20,8 +20,9 @@ cov = sk.covariance()
 |---|---|
 | `n_assets` | inferred from the first `update` |
 | `lambda_vol` | frozen structural constant 0.98 (`CONSTANTS.lambda_vol`). The `h/b` derivation was falsified by crisis sub-periods; 0.98 is the single remaining empirically set constant, disclosed as such |
-| `lambda_corr` (single scale) | removed — the ladder is the estimator; single-scale remains a v1 mode |
-| `corr_half_lives` | derived: `(half_life/4, half_life, half_life*4)` |
+
+| `lambda_corr` | **the** parameter: `lam` (default 0.996, the classical anchor decay) |
+| `corr_half_lives` | derived: decays `(lam**4, lam, lam**(1/4))` — half-lives `(h/4, h, 4h)` with `h = -1/log2(lam)` |
 | `corr_theta` | frozen at ½ (rung weights ∝ √h; θ=0 fails the n=300 veto) |
 | `kappa` | state, not parameter: κ_t = ⅓·EWMA_h(activity); with the per-asset market clocks each asset's activity is the row-normalized Schur-square neighborhood mean of squared surprises — clusters get their own clocks with no cluster identification |
 | `shrinkage` / `shrinkage_delta` | self-tuning per-rung intensity α = min(1,c)·g̃²/(g̃²+(1−g̃)²·max(0,1/c−1)) from the online concentration c = n/ν and de-noised equicorrelation-explained fraction g̃ — δ is gone |

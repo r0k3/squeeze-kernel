@@ -59,10 +59,12 @@ class SqueezeKernel:
 
     Parameters
     ----------
-    half_life : float
-        The single tunable: the anchor correlation half-life in trading
-        days.  The timescale ladder ``(h/b, h, h*b)``, the kernel-scale
-        clock, and the rung weights all derive from it.  Default 173.
+    lam : float
+        The single tunable: the exponential decay of the anchor
+        correlation timescale per trading day, in the classical EWMA
+        convention (default 0.996, a half-life of about 173 days).  The
+        timescale ladder ``(lam**b, lam, lam**(1/b))`` with ``b = 4``, the
+        kernel-scale clock, and the rung weights all derive from it.
 
     Everything else is structural or self-tuning state: per-asset market
     clocks read from the correlation neighborhood (row-normalized Schur-
@@ -74,18 +76,23 @@ class SqueezeKernel:
     on ``SqueezeKernelEstimator``.
     """
 
-    def __init__(self, half_life: float = 173.0) -> None:
-        if half_life <= 0:
-            raise ValueError("half_life must be positive.")
-        self.half_life = float(half_life)
+    def __init__(self, lam: float = 0.996) -> None:
+        if not (0.0 < lam < 1.0):
+            raise ValueError("lam must be in (0, 1).")
+        self.lam = float(lam)
         self._est: SqueezeKernelEstimator | None = None
         self._t = 0
+
+    @property
+    def half_life(self) -> float:
+        """Anchor half-life in trading days implied by ``lam``."""
+        return float(-1.0 / np.log2(self.lam))
 
     # ── lifecycle ────────────────────────────────────────────────────────
 
     def _build(self, n_assets: int) -> SqueezeKernelEstimator:
         c = CONSTANTS
-        h = self.half_life
+        h = self.half_life                    # ladder = (lam**b, lam, lam**(1/b))
         ladder = (h / c.b, h, h * c.b)
         return SqueezeKernelEstimator(
             n_assets,

@@ -14,13 +14,13 @@ References: *"The Squeeze Kernel Covariance Estimator: Dual-Timescale Tracking w
 ```python
 from squeeze_kernel import SqueezeKernel
 
-sk = SqueezeKernel(half_life=173)    # the entire public surface
+sk = SqueezeKernel(lam=0.996)        # the entire public surface
 for r_t in returns:                  # NaN marks missing assets
     sk.update(r_t)
 cov = sk.covariance()
 ```
 
-Everything else is derived from the half-life or is a frozen structural
+Everything else is derived from λ or is a frozen structural
 constant — including the shrinkage intensity, which self-tunes per
 timescale from the online concentration `c = n/ν` and the de-noised
 factor-fit `g̃`: `α = min(1,c)·g̃²/(g̃²+(1−g̃)²·max(0,1/c−1))`. No δ, no κ,

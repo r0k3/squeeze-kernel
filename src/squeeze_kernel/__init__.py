@@ -3,7 +3,7 @@ Squeeze Kernel Covariance Estimator
 ====================================
 
 Streaming, PSD-by-construction covariance estimator. The 2.0 API is one
-number; everything else derives from the half-life, is a frozen
+number; everything else derives from that decay, is a frozen
 structural constant, or is self-tuning state — including per-asset
 market clocks read from the correlation structure itself.
 
@@ -14,7 +14,7 @@ Quick start::
 
     returns = np.random.default_rng(42).normal(0.0, 0.01, size=(250, 30))
 
-    sk = SqueezeKernel(half_life=173)    # the entire public surface
+    sk = SqueezeKernel(lam=0.996)        # the entire public surface
     for r_t in returns:
         sk.update(r_t)                   # NaN marks missing assets
 

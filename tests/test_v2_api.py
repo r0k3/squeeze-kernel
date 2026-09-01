@@ -34,10 +34,10 @@ def _nll(cov, r):
 def _v2_estimator(n, **overrides):
     """The SqueezeKernel default configuration at estimator level, with
     ablation overrides (the 2.0 public class has no switches)."""
+    h = -1.0 / np.log2(0.996)
     kw = dict(lambda_vol=CONSTANTS.lambda_vol, shrinkage="auto",
               shrinkage_target="cluster",
-              corr_half_lives=(173.0 / CONSTANTS.b, 173.0,
-                               173.0 * CONSTANTS.b),
+              corr_half_lives=(h / CONSTANTS.b, h, h * CONSTANTS.b),
               corr_theta=CONSTANTS.theta, kappa_mode="adaptive",
               alpha_rule="selftuning", level_match=False, detector=True,
               clock="asset", epsilon=CONSTANTS.epsilon)
@@ -79,7 +79,7 @@ def golden():
 
 def test_public_class_matches_research_engine(golden):
     X, es, d = golden
-    nll = _library_nll_path(X, es, half_life=173.0)
+    nll = _library_nll_path(X, es, lam=0.996)
     ref = d["nll_full"]
     both = np.isfinite(nll) & np.isfinite(ref)
     assert (np.isfinite(nll) == np.isfinite(ref)).all()
@@ -104,9 +104,13 @@ def test_matches_research_engine(golden, name, over):
 
 
 def test_derived_ladder():
-    sk = SqueezeKernel(half_life=173.0)
+    sk = SqueezeKernel(lam=0.996)
     est = sk._build(5)
-    assert tuple(est.corr_half_lives) == (43.25, 173.0, 692.0)
+    h = sk.half_life
+    assert abs(h - 172.94) < 0.01
+    assert np.allclose(est.corr_half_lives, (h / 4, h, 4 * h))
+    assert np.allclose(2.0 ** (-1.0 / np.asarray(est.corr_half_lives)),
+                       (0.996 ** 4, 0.996, 0.996 ** 0.25))
     assert est.corr_theta == CONSTANTS.theta == 0.5
     assert est.clock == "asset"
 
@@ -165,7 +169,7 @@ def test_state_diagnostics():
 def test_no_public_switches():
     import inspect
     sig = inspect.signature(SqueezeKernel.__init__)
-    assert list(sig.parameters) == ["self", "half_life"]
+    assert list(sig.parameters) == ["self", "lam"]
 
 
 def test_v1_escape_hatch():
