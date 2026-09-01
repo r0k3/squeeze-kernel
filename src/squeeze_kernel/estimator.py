@@ -324,6 +324,7 @@ class SqueezeKernelEstimator:
         alpha_rule: str = "published",
         level_match: bool = True,
         detector: bool = True,
+        clock: str = "global",
     ):
         self.n_assets = n_assets
         self.lambda_vol = lambda_vol
@@ -368,6 +369,13 @@ class SqueezeKernelEstimator:
                 "kappa_mode='adaptive' and alpha_rule='selftuning' require "
                 "the correlation ladder (corr_half_lives)."
             )
+        if clock not in ("global", "asset"):
+            raise ValueError("clock must be 'global' or 'asset'.")
+        if clock == "asset" and corr_half_lives is None:
+            raise ValueError("clock='asset' requires the correlation ladder.")
+        if clock == "asset" and weight_statistic != "marginal":
+            raise ValueError("clock='asset' supports weight_statistic='marginal'.")
+        self.clock = clock
         self.kappa_mode = kappa_mode
         self.alpha_rule = alpha_rule
         self.level_match = level_match
@@ -376,6 +384,22 @@ class SqueezeKernelEstimator:
         self._kap_lam = 0.0                # set with the ladder below
         self._J_list: list[float] | None = None
         self._offmask_cache: np.ndarray | None = None
+        # v2 per-asset market clocks (clock='asset'): each asset's trading
+        # time advances with the squared surprise of its correlation
+        # neighborhood (row-normalized Schur-square weighting of z^2); the
+        # rung update becomes the PSD diagonal congruence
+        #   Q_ij <- sqrt((1-eta_i)(1-eta_j)) Q_ij + sqrt(eta_i eta_j) z_i z_j,
+        # exactly the chord when clocks equalize. Missing assets keep the
+        # global clock; nu/alpha/detector stay on the global clock.
+        self._S_asset: np.ndarray | None = None
+        self._kap_asset: np.ndarray | None = None
+        self._C_prev: np.ndarray | None = None
+        self._corr_blend_buf: np.ndarray | None = None
+        if clock == "asset":
+            khl = np.asarray(corr_half_lives, dtype=np.float64)
+            self._S_asset = np.full((khl.size, n_assets), float(epsilon))
+            self._kap_asset = np.ones(n_assets)
+            self._C_prev = np.eye(n_assets)
 
         # Scale-free correlation memory (opt-in): replace the single correlation
         # timescale by a positive combination of EWMAs on a geometric half-life
@@ -611,11 +635,37 @@ class SqueezeKernelEstimator:
             assert corr_w is not None  # allocated together with corr_lam
             J_list = self._J_list
             assert J_list is not None
+            w_vec = None
+            if self.clock == "asset" and n_obs > 0:
+                C_prev = self._C_prev
+                kap_a = self._kap_asset
+                assert C_prev is not None and kap_a is not None
+                H = C_prev * C_prev
+                denom = H @ finite.astype(np.float64)
+                a_act = (H @ (z_t * z_t)) / np.maximum(denom, eps)
+                w_vec = np.where(finite,
+                                 a_act / (a_act + self._kappa_c * kap_a),
+                                 w_t)
+                self._kap_asset = np.where(
+                    finite,
+                    self._kap_lam * kap_a + (1.0 - self._kap_lam) * a_act,
+                    kap_a)
             s_eff = 0.0
             for k in range(corr_lam.size):
                 S_list[k] = corr_lam[k] * S_list[k] + w_t
                 J_list[k] = corr_lam[k] * corr_lam[k] * J_list[k] + w_t
-                if add:
+                if w_vec is not None:
+                    S_a = self._S_asset
+                    assert S_a is not None
+                    S_a[k] = corr_lam[k] * S_a[k] + w_vec
+                    eta_v = w_vec / S_a[k]
+                    o = np.sqrt(1.0 - eta_v)
+                    u = np.sqrt(eta_v) * z_t
+                    np.multiply.outer(o, o, out=self._scratch_had)
+                    Q_list[k] *= self._scratch_had
+                    np.multiply.outer(u, u, out=self._scratch_had)
+                    Q_list[k] += self._scratch_had
+                elif add:
                     eta = w_t / S_list[k]
                     Q_list[k] *= 1.0 - eta
                     np.multiply(self._scratch_outer, eta, out=self._scratch_had)
@@ -626,6 +676,8 @@ class SqueezeKernelEstimator:
         self._dirty = True
         if self._adaptive:
             self._materialize_adaptive()
+        elif self.clock == "asset":
+            self._materialize()          # C_prev must advance daily
         self._last_weight = w_t
         return w_t
 
@@ -841,11 +893,20 @@ class SqueezeKernelEstimator:
         sig_k = []
         J_list = self._J_list
         assert J_list is not None
-        for k in range(corr_lam.size):
+        K = corr_lam.size
+        if self.clock == "asset" and self._corr_blend_buf is None:
+            self._corr_blend_buf = np.empty((K, self.n_assets, self.n_assets))
+        for k in range(K):
             corr_k = self._shrunk_corr_from_Q(Q_list[k], S_list[k], J_list[k])
+            if self.clock == "asset":
+                self._corr_blend_buf[k][:] = corr_k
             sig_k.append(corr_k * vv)
         detector.record(sig_k)
         w = detector.blend(corr_w)
+        if self.clock == "asset":
+            # next day's neighborhood weighting: the emitted blend of the
+            # shrunk rung correlations
+            self._C_prev = np.tensordot(w, self._corr_blend_buf, axes=1)
         cov = w[0] * sig_k[0]
         for k in range(1, len(sig_k)):
             cov = cov + w[k] * sig_k[k]
@@ -892,6 +953,8 @@ class SqueezeKernelEstimator:
                                                   J_list[k])
                 corr_k *= corr_w[k]
                 mix += corr_k
+            if self.clock == "asset":
+                self._C_prev = mix.copy()
             cov = mix
             np.multiply.outer(vol_t, vol_t, out=self._scratch_outer)
             cov *= self._scratch_outer

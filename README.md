@@ -14,8 +14,8 @@ References: *"The Squeeze Kernel Covariance Estimator: Dual-Timescale Tracking w
 ```python
 from squeeze_kernel import SqueezeKernel
 
-sk = SqueezeKernel(half_life=173, detector=True, cluster_target=True)
-for r_t in returns:              # NaN marks missing assets
+sk = SqueezeKernel(half_life=173)    # the entire public surface
+for r_t in returns:                  # NaN marks missing assets
     sk.update(r_t)
 cov = sk.covariance()
 ```

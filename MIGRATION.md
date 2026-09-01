@@ -8,8 +8,8 @@ golden tests still pin the published numbers bit-for-bit.
 ```python
 from squeeze_kernel import SqueezeKernel
 
-sk = SqueezeKernel(half_life=173, detector=True, cluster_target=True)
-for r_t in returns:          # NaN marks missing assets
+sk = SqueezeKernel(half_life=173)      # the entire public surface
+for r_t in returns:                    # NaN marks missing assets
     sk.update(r_t)
 cov = sk.covariance()
 ```
@@ -21,12 +21,12 @@ cov = sk.covariance()
 | `n_assets` | inferred from the first `update` |
 | `lambda_vol` | frozen structural constant 0.98 (`CONSTANTS.lambda_vol`). The `h/b` derivation was falsified by crisis sub-periods; 0.98 is the single remaining empirically set constant, disclosed as such |
 | `lambda_corr` (single scale) | removed — the ladder is the estimator; single-scale remains a v1 mode |
-| `corr_half_lives` | derived: `half_life * (43, 173, 693) / 173` |
+| `corr_half_lives` | derived: `(half_life/4, half_life, half_life*4)` |
 | `corr_theta` | frozen at ½ (rung weights ∝ √h; θ=0 fails the n=300 veto) |
-| `kappa` | state, not parameter: κ_t = ⅓·EWMA_h(d²) (χ²-null constant ⅓) |
+| `kappa` | state, not parameter: κ_t = ⅓·EWMA_h(activity); with the per-asset market clocks each asset's activity is the row-normalized Schur-square neighborhood mean of squared surprises — clusters get their own clocks with no cluster identification |
 | `shrinkage` / `shrinkage_delta` | self-tuning per-rung intensity α = min(1,c)·g̃²/(g̃²+(1−g̃)²·max(0,1/c−1)) from the online concentration c = n/ν and de-noised equicorrelation-explained fraction g̃ — δ is gone |
-| `shrinkage_target` | `cluster_target` boolean; the cluster target is the γ=1 Hadamard square (p=2, veto-selected; PSD by the Schur product theorem) |
-| detector (always-on in v1 ladder mode) | `detector` boolean |
+| `shrinkage_target` | always the γ=1 Hadamard-square cluster target (p=2, veto-selected; PSD by the Schur product theorem); the equicorrelation target remains an estimator-level flag |
+| detector (always-on in v1 ladder mode) | always on (self-silencing under its false-alarm budget); estimator-level flag for ablation |
 | `weight_statistic="mahalanobis"` | removed from 2.0 (post-mortem: the equicorrelation surprise discount is crisis-regressive); v1 opt-in unchanged |
 | `lambda_corr_fast`, `vol_anchor_phi/decay` | v1 opt-ins, unchanged there; not part of 2.0 |
 | `impute_missing`, `min_obs`, `epsilon` | v1 options; 2.0 handles missing via NaN/mask natively with `epsilon` structural |

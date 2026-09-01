@@ -31,6 +31,34 @@ def _nll(cov, r):
     return float(logdet + r @ np.linalg.solve(cov, r))
 
 
+def _v2_estimator(n, **overrides):
+    """The SqueezeKernel default configuration at estimator level, with
+    ablation overrides (the 2.0 public class has no switches)."""
+    kw = dict(lambda_vol=CONSTANTS.lambda_vol, shrinkage="auto",
+              shrinkage_target="cluster",
+              corr_half_lives=(173.0 / CONSTANTS.b, 173.0,
+                               173.0 * CONSTANTS.b),
+              corr_theta=CONSTANTS.theta, kappa_mode="adaptive",
+              alpha_rule="selftuning", level_match=False, detector=True,
+              clock="asset", epsilon=CONSTANTS.epsilon)
+    kw.update(overrides)
+    return SqueezeKernelEstimator(n, **kw)
+
+
+def _nll_path(est_factory, X, eval_start):
+    est = None
+    out = []
+    for t in range(X.shape[0] - 1):
+        if est is None:
+            est = est_factory(X.shape[1])
+        est.update(X[t])
+        if t >= eval_start:
+            rn = X[t + 1]
+            out.append(_nll(_make_spd(est.get_cov()), rn)
+                       if np.isfinite(rn).all() else np.nan)
+    return np.asarray(out)
+
+
 def _library_nll_path(X, eval_start, **kw):
     sk = SqueezeKernel(**kw)
     out = []
@@ -49,14 +77,24 @@ def golden():
     return d["X"], int(d["eval_start"][0]), d
 
 
-@pytest.mark.parametrize("name,kw", [
-    ("full", dict(half_life=173.0)),
-    ("equi", dict(half_life=173.0, cluster_target=False)),
-    ("nodet", dict(half_life=173.0, detector=False)),
-])
-def test_matches_research_engine(golden, name, kw):
+def test_public_class_matches_research_engine(golden):
     X, es, d = golden
-    nll = _library_nll_path(X, es, **kw)
+    nll = _library_nll_path(X, es, half_life=173.0)
+    ref = d["nll_full"]
+    both = np.isfinite(nll) & np.isfinite(ref)
+    assert (np.isfinite(nll) == np.isfinite(ref)).all()
+    dmax = float(np.max(np.abs(nll[both] - ref[both])))
+    assert dmax < 1e-8, f"public class: max per-day NLL drift {dmax:.2e}"
+
+
+@pytest.mark.parametrize("name,over", [
+    ("equi", dict(shrinkage_target="equicorrelation")),
+    ("nodet", dict(detector=False)),
+    ("globalclock", dict(clock="global")),
+])
+def test_matches_research_engine(golden, name, over):
+    X, es, d = golden
+    nll = _nll_path(lambda n: _v2_estimator(n, **over), X, es)
     ref = d[f"nll_{name}"]
     assert nll.shape == ref.shape
     both = np.isfinite(nll) & np.isfinite(ref)
@@ -65,11 +103,28 @@ def test_matches_research_engine(golden, name, kw):
     assert dmax < 1e-8, f"{name}: max per-day NLL drift {dmax:.2e}"
 
 
-def test_canonical_ladder_exact():
+def test_derived_ladder():
     sk = SqueezeKernel(half_life=173.0)
     est = sk._build(5)
-    assert tuple(est.corr_half_lives) == (43.0, 173.0, 693.0)
+    assert tuple(est.corr_half_lives) == (43.25, 173.0, 692.0)
     assert est.corr_theta == CONSTANTS.theta == 0.5
+    assert est.clock == "asset"
+
+
+def test_asset_clocks_differentiate():
+    # two independent blocks; shock only block A: A's clocks must run
+    # ahead of B's
+    rng = np.random.default_rng(9)
+    n = 12
+    X = rng.standard_normal((224, n)) * 0.01
+    X[:, :6] += np.outer(rng.standard_normal(224) * 0.01, np.ones(6))
+    X[200:, :6] *= 6.0                          # block-A stress to the end
+    sk = SqueezeKernel()
+    for r in X:
+        sk.update(r)
+    S_a = sk._est._S_asset                      # fast rung, at stress end
+    assert S_a is not None
+    assert S_a[0, :6].mean() > S_a[0, 6:].mean()
 
 
 def test_lazy_n_and_mask():
@@ -105,6 +160,12 @@ def test_state_diagnostics():
     assert st["t"] == 120 and st["n_assets"] == 10
     assert len(st["rung_nu"]) == 3 and st["rung_nu"][0] > 1
     assert 0.0 < st["kappa_t"] < 2.0
+
+
+def test_no_public_switches():
+    import inspect
+    sig = inspect.signature(SqueezeKernel.__init__)
+    assert list(sig.parameters) == ["self", "half_life"]
 
 
 def test_v1_escape_hatch():

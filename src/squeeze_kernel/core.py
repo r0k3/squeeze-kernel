@@ -43,11 +43,10 @@ class StructuralConstants:
     Importable for research; not constructor arguments.
     """
 
-    ladder_days: tuple[float, float, float] = (43.0, 173.0, 693.0)
-    anchor: float = 173.0           # ladder scales as half_life * days/anchor
+    b: float = 4.0                  # ladder spacing: rungs (h/b, h, h*b)
     theta: float = 0.5              # rung weights ~ h^theta
     lambda_vol: float = 0.98        # frozen empirical (not derived from h)
-    kappa_c: float = 1.0 / 3.0      # kappa_t = kappa_c * EWMA_h(d^2)
+    kappa_c: float = 1.0 / 3.0      # kernel scale: kappa = kappa_c * EWMA(activity)
     schur_p: int = 2                # Hadamard power of the cluster target
     epsilon: float = 1e-8
 
@@ -56,30 +55,29 @@ CONSTANTS = StructuralConstants()
 
 
 class SqueezeKernel:
-    """Streaming covariance estimator with a one-number public surface.
+    """Streaming covariance estimator whose public surface is one number.
 
     Parameters
     ----------
     half_life : float
         The single tunable: the anchor correlation half-life in trading
-        days.  The ladder, kernel-scale EWMA and rung weights all derive
-        from it.  Default 173 (the published configuration).
-    detector : bool
-        Sequential surprise-gated rung weights (default True).
-    cluster_target : bool
-        Shrink toward the Schur-square cluster target (True, default) or
-        the equicorrelation target (False).
+        days.  The timescale ladder ``(h/b, h, h*b)``, the kernel-scale
+        clock, and the rung weights all derive from it.  Default 173.
 
+    Everything else is structural or self-tuning state: per-asset market
+    clocks read from the correlation neighborhood (row-normalized Schur-
+    square weighting of squared surprises), a per-timescale shrinkage
+    intensity from the online concentration and target-fit, the Schur-
+    square cluster target, and the surprise-gated timescale weights.
     The number of assets is inferred from the first ``update`` call.
+    The published v1 estimator and every ablation switch remain available
+    on ``SqueezeKernelEstimator``.
     """
 
-    def __init__(self, half_life: float = 173.0, *, detector: bool = True,
-                 cluster_target: bool = True) -> None:
+    def __init__(self, half_life: float = 173.0) -> None:
         if half_life <= 0:
             raise ValueError("half_life must be positive.")
         self.half_life = float(half_life)
-        self.detector = bool(detector)
-        self.cluster_target = bool(cluster_target)
         self._est: SqueezeKernelEstimator | None = None
         self._t = 0
 
@@ -87,20 +85,20 @@ class SqueezeKernel:
 
     def _build(self, n_assets: int) -> SqueezeKernelEstimator:
         c = CONSTANTS
-        # multiply first: exact canonical rungs (43, 173, 693) at h=173
-        ladder = tuple((self.half_life * d) / c.anchor for d in c.ladder_days)
+        h = self.half_life
+        ladder = (h / c.b, h, h * c.b)
         return SqueezeKernelEstimator(
             n_assets,
             lambda_vol=c.lambda_vol,
             shrinkage="auto",
-            shrinkage_target="cluster" if self.cluster_target
-            else "equicorrelation",
+            shrinkage_target="cluster",
             corr_half_lives=ladder,
             corr_theta=c.theta,
             kappa_mode="adaptive",
             alpha_rule="selftuning",
             level_match=False,
-            detector=self.detector,
+            detector=True,
+            clock="asset",
             epsilon=c.epsilon,
         )
 
