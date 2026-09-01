@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.0.0 (unreleased)
+## 2.0.0 (2026-09-01)
 
 Breaking: the public estimator is `SqueezeKernel(lam=0.996)` — one
 number, the exponential decay of the anchor correlation timescale.
