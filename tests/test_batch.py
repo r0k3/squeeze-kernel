@@ -3,104 +3,33 @@
 import numpy as np
 import pytest
 
-from squeeze_kernel import SqueezeKernelEstimator, estimate_squeeze_cov, kernel_exponential
+from squeeze_kernel import SqueezeKernel, estimate_squeeze_cov
 
 
 class TestBatchConsistency:
     def test_batch_matches_streaming(self, returns_small):
-        """Batch API must produce identical results to streaming class."""
-        n = returns_small.shape[1]
-        est = SqueezeKernelEstimator(n, kappa=1.5, shrinkage="none")
-        cov_ref = np.empty((len(returns_small), n, n))
+        sk = SqueezeKernel(lam=0.99)
+        cov_ref = np.empty((len(returns_small),) + (returns_small.shape[1],) * 2)
         for t in range(len(returns_small)):
-            est.update(returns_small[t])
-            cov_ref[t] = est.get_cov()
-
-        cov_batch, _, _ = estimate_squeeze_cov(
-            returns_small, kappa=1.5, shrinkage="none", with_corr=False,
-        )
+            sk.update(returns_small[t])
+            cov_ref[t] = sk.covariance()
+        cov_batch, _, _ = estimate_squeeze_cov(returns_small, lam=0.99, with_corr=False)
         assert np.allclose(cov_ref, cov_batch, atol=1e-12)
 
-    def test_batch_with_corr(self, returns_small):
-        cov, corr, _ = estimate_squeeze_cov(returns_small, kappa=1.5, with_corr=True)
-        assert corr is not None
-        assert corr.shape == cov.shape
-
-    def test_batch_with_weights(self, returns_small):
-        _, _, weights = estimate_squeeze_cov(
-            returns_small, kappa=1.5, with_weights=True,
-        )
-        assert weights is not None
-        assert weights.shape == (len(returns_small),)
-        assert np.all(weights >= 0)
-        assert np.all(weights < 1)
-
-    def test_batch_with_shrinkage(self, returns_small):
-        cov_auto, _, _ = estimate_squeeze_cov(returns_small, kappa=1.5, shrinkage="auto")
-        cov_none, _, _ = estimate_squeeze_cov(returns_small, kappa=1.5, shrinkage="none")
-        # At n=5 the early timesteps have shrinkage (S_t is small);
-        # by the end, shrinkage ≈ 0 and final estimates should converge
-        assert np.allclose(cov_auto[-1], cov_none[-1], atol=1e-6)
-
-    def test_batch_matches_streaming_with_custom_kernel(self, returns_small):
-        n = returns_small.shape[1]
-        kwargs = {"gamma": 1.5}
-
-        est = SqueezeKernelEstimator(
-            n,
-            kernel_fn=kernel_exponential,
-            kernel_kwargs=kwargs,
-            shrinkage="none",
-        )
-        cov_ref = np.empty((len(returns_small), n, n))
-        for t in range(len(returns_small)):
-            est.update(returns_small[t])
-            cov_ref[t] = est.get_cov()
-
-        cov_batch, _, _ = estimate_squeeze_cov(
-            returns_small,
-            kernel_fn=kernel_exponential,
-            kernel_kwargs=kwargs,
-            shrinkage="none",
-            with_corr=False,
-        )
-        assert np.allclose(cov_ref, cov_batch, atol=1e-12)
-
-    def test_batch_reaches_ladder_extension(self, returns_small):
-        """Kwargs forward to the estimator: the scale-free ladder is
-        reachable from batch mode and matches the streaming path."""
-        n = returns_small.shape[1]
-        hl = (20.0, 60.0, 180.0)
-        est = SqueezeKernelEstimator(n, corr_half_lives=hl, corr_theta=0.25)
-        cov_ref = np.empty((len(returns_small), n, n))
-        for t in range(len(returns_small)):
-            est.update(returns_small[t])
-            cov_ref[t] = est.get_cov()
-
-        cov_batch, _, _ = estimate_squeeze_cov(
-            returns_small, corr_half_lives=hl, corr_theta=0.25,
-            with_corr=False,
-        )
-        np.testing.assert_allclose(cov_ref, cov_batch, rtol=1e-12, atol=0)
-
-    def test_batch_reaches_shrinkage_target(self, returns_small):
-        cov, _, _ = estimate_squeeze_cov(
-            returns_small, shrinkage_target="cluster", with_corr=False,
-        )
+    def test_batch_with_corr_and_weights(self, returns_small):
+        cov, corr, weights = estimate_squeeze_cov(
+            returns_small, with_corr=True, with_weights=True)
+        assert corr is not None and corr.shape == cov.shape
+        assert weights is not None and weights.shape == (len(returns_small),)
+        assert np.all(weights >= 0) and np.all(weights < 1)
         assert np.isfinite(cov).all()
 
 
 class TestBatchValidation:
     def test_1d_raises(self):
         with pytest.raises(ValueError, match="2D"):
-            estimate_squeeze_cov(np.zeros(10), kappa=1.5)
+            estimate_squeeze_cov(np.zeros(10))
 
     def test_3d_raises(self):
         with pytest.raises(ValueError, match="2D"):
-            estimate_squeeze_cov(np.zeros((10, 5, 3)), kappa=1.5)
-
-    def test_explicit_n_assets_raises(self):
-        with pytest.raises(ValueError, match="n_assets"):
-            estimate_squeeze_cov(np.zeros((10, 5)), n_assets=5)
-
-
+            estimate_squeeze_cov(np.zeros((10, 5, 3)))

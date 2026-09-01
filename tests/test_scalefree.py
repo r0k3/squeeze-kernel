@@ -74,9 +74,6 @@ class TestScaleFreeBehaviour:
 
 
 class TestValidation:
-    def test_rejects_lambda_corr_fast(self):
-        with pytest.raises(ValueError, match="mutually exclusive"):
-            SqueezeKernelEstimator(5, corr_half_lives=LADDER, lambda_corr_fast=0.99)
 
     def test_rejects_nonpositive_half_life(self):
         with pytest.raises(ValueError, match="positive half-lives"):

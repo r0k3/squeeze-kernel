@@ -14,30 +14,16 @@ the covariance matrix that drives it:
   * positions drift with prices between rebalances (no intra-month trading).
 
 Covariance arms:
-  * Squeeze Kernel   — streaming, one O(n^2) update per day.  Configuration:
-                       the multi-scale correlation ladder
-                       corr_half_lives=(43, 173, 693), a fast volatility clock
-                       lambda_vol=0.92 (~8-day half-life), kappa=0.5, and the
-                       OU volatility anchor vol_anchor_phi=0.98 (~34-day
-                       half-life).  Read it as a two-timescale volatility
-                       structure: the paper's 34-day vol clock becomes the slow
-                       anchor and the fast clock drops to ~8 days for
-                       deployment-grade reactivity.
+  * Squeeze Kernel   — streaming, one O(n^2) update per day, run with its
+                       single public number at the library default,
+                       SqueezeKernel(lam=0.996).  Nothing is tuned on this
+                       panel.
   * Ledoit-Wolf      — scikit-learn's own implementation, refit on a trailing
                        252-day window at every rebalance (the classical
-                       "well-conditioned estimator" baseline our paper cites).
-
+                       "well-conditioned estimator" baseline).
 Reporting window: stats and charts cover REPORT_START (2010) onward; the
 strategy trades — and the streaming estimator warms — from 2001, so no
 estimator sees the reported window cold.
-
-Robustness (all numbers reproducible by editing the constants; quoted for the
-reported window): the margin is a plateau, not a peak.  Every anchored ladder
-configuration with lambda_vol in [0.90, 0.96] and kappa in [0.15, 1.0] lands
-at Sharpe 0.95-1.02; the untouched library defaults score 0.93.  Ledoit-Wolf
-reaches 0.80 at its standard 252-day window and 0.89 at its in-hindsight best
-window (126 days; set LW_LOOKBACK to verify) — below every squeeze
-configuration tested.  The comparison does not depend on the exact settings.
 
 An equal-risk-contribution (ERC) weight rule is included below for comparison.
 On a homogeneous large-cap panel ERC is nearly inverse-volatility weighting,
@@ -64,7 +50,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from squeeze_kernel import SqueezeKernelEstimator
+from squeeze_kernel import SqueezeKernel
 
 # ── Configuration ────────────────────────────────────────────────────────────
 VOL_TARGET = 0.15          # annualized ex-ante volatility target
@@ -181,15 +167,14 @@ def perf_stats(r: np.ndarray, turnover: np.ndarray,
 
 
 # ── Covariance streams ───────────────────────────────────────────────────────
-def squeeze_covs(returns: np.ndarray, rebal_idx: np.ndarray,
-                 **kwargs) -> dict[int, np.ndarray]:
-    est = SqueezeKernelEstimator(n_assets=returns.shape[1], **kwargs)
+def squeeze_covs(returns: np.ndarray, rebal_idx: np.ndarray) -> dict[int, np.ndarray]:
+    sk = SqueezeKernel()                      # lam=0.996, nothing else
     need = set(int(i) for i in rebal_idx)
     out: dict[int, np.ndarray] = {}
     for d in range(returns.shape[0]):
-        est.update(returns[d])
+        sk.update(returns[d])
         if d in need:
-            out[d] = est.get_cov()
+            out[d] = sk.covariance()
     return out
 
 
@@ -219,10 +204,7 @@ def main() -> None:
           f"({dates[rebal_idx[0]].date()} -> {dates[rebal_idx[-1]].date()})")
 
     t0 = time.perf_counter()
-    covs_sq = squeeze_covs(returns, rebal_idx,
-                           corr_half_lives=(43, 173, 693),
-                           lambda_vol=0.92, kappa=0.5,
-                           vol_anchor_phi=0.98)
+    covs_sq = squeeze_covs(returns, rebal_idx)
     t_sq = time.perf_counter() - t0
     t0 = time.perf_counter()
     covs_lw = ledoit_wolf_covs(returns, rebal_idx)

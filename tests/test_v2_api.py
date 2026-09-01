@@ -137,7 +137,8 @@ def test_lazy_n_and_mask():
     r = rng.normal(0, 0.01, 8)
     sk.update(r, mask=np.ones(8, bool))
     assert sk.state()["n_assets"] == 8
-    m = np.ones(8, bool); m[2] = False
+    m = np.ones(8, bool)
+    m[2] = False
     sk.update(r, mask=m)
     cov = sk.covariance()
     assert cov.shape == (8, 8) and np.isfinite(cov).all()
@@ -187,7 +188,8 @@ def test_defaults_do_not_touch_v1():
     b = SqueezeKernelEstimator(6, kappa_mode="fixed", alpha_rule="published",
                                level_match=True, detector=True)
     for r in X:
-        a.update(r); b.update(r)
+        a.update(r)
+        b.update(r)
     assert np.array_equal(a.get_cov(), b.get_cov())
 
 

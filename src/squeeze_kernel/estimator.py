@@ -15,9 +15,7 @@ try:
 except ImportError:  # pragma: no cover
     _cho_factor = _cho_solve = None
 
-from squeeze_kernel.kernels import (
-    KernelFn, kernel_fisher, calibrate_kappa, extract_d2_series,
-)
+from squeeze_kernel.kernels import kernel_fisher
 from numpy.typing import ArrayLike
 
 if TYPE_CHECKING:
@@ -131,161 +129,66 @@ class _SurpriseDetector:
 
 
 class SqueezeKernelEstimator:
-    """Streaming robust covariance estimator with pluggable kernel weighting.
+    """The Squeeze Kernel estimator with its full switch surface.
 
-    The estimator is positive semi-definite by construction at every time step,
-    handles missing observations natively, and separates volatility and
-    correlation dynamics through dual-timescale EWMAs.  An adaptive
-    equicorrelation shrinkage rule automatically calibrates regularisation
-    to the concentration ratio n / T_eff.
+    ``SqueezeKernel`` (one number, ``lam``) is the public front-end; this
+    class is the engine behind it and the home of every reproduction and
+    ablation switch.  The defaults reproduce the published v1 single-scale
+    estimator bit-for-bit; ``corr_half_lives``, ``shrinkage_target`` and
+    ``corr_theta`` give the published v1 adaptive configuration; the
+    ``kappa_mode``, ``alpha_rule``, ``level_match``, ``detector`` and
+    ``clock`` switches are the 2.0 mechanics.  Positive semi-definite by
+    construction, missing values (NaN) native, O(K n^2) per update.
 
     Parameters
     ----------
     n_assets : int
-        Number of assets.
     lambda_vol : float
-        Decay factor for per-asset volatility EWMA (default 0.98,
-        half-life ≈ 34 trading days).
+        Per-asset variance EWMA decay (default 0.98).
     lambda_corr : float
-        Decay factor for correlation EWMA (default 0.996, half-life
-        ≈ 173 trading days, effective sample size ≈ 250).
-    kappa : float, optional
-        Saturation parameter for the default Fisher kernel (default 0.25).
-        The defaults for ``lambda_vol``, ``lambda_corr`` and ``kappa`` are
-        the values recommended in the paper for panels of daily financial
-        returns; they were selected by time-series cross-validation and are
-        insensitive to moderate perturbation.
-    kernel_fn : callable, optional
-        Custom kernel ``(d2, *, n_observed, **kw) -> float``.
-        If omitted, the estimator uses ``kernel_fisher``.
-    kernel_kwargs : dict, optional
-        Extra keyword arguments forwarded to ``kernel_fn``.
-        Use this to configure alternative kernels such as
-        ``kernel_exponential(gamma=...)``.
+        Single-scale correlation decay (default 0.996); ignored when a
+        ladder is configured.
+    kappa : float
+        Fixed kernel scale of the saturating weight w = d²/(d² + kappa)
+        (default 0.25); ignored under ``kappa_mode='adaptive'``.
     epsilon : float
         Numerical floor (default 1e-8).
     shrinkage : str or float
-        ``'auto'`` (default) for adaptive shrinkage,
-        ``0`` or ``'none'`` to disable, or a float in [0, 1] for fixed intensity.
+        ``'auto'`` (default) for adaptive intensity, ``'none'``/``0`` to
+        disable, or a fixed float in [0, 1].
     shrinkage_delta : float
-        Threshold for adaptive shrinkage (default 0.10).
-    impute_missing : bool
-        If True, impute missing standardized returns from correlated assets.
-    impute_threshold : float
-        Minimum |correlation| for imputation donors (default 0.6).
-    weight_statistic : str
-        Statistic fed to the kernel.  ``'marginal'`` (default) uses the mean
-        squared standardized return d² = z'z/N — the published estimator.
-        ``'mahalanobis'`` uses the score-exact surprise z'C⁻¹z/N measured
-        against the estimator's own previous correlation matrix (one linear
-        solve per update).  With κ ≈ 1 (the parameter-free default, since
-        E[z'C⁻¹z/N] = 1 under a correct C) this improved one-step NLL by
-        ≈2.5 points on the S&P-500 n=100 benchmark, holdout-confirmed.
-        IMPORTANT — regime-dependent: the advantage inverts in the
-        high-concentration regime (≈12 NLL worse at n=200 and ≈61 worse at
-        n=300 with T_eff = 250), because the estimated inverse inflates the
-        statistic as n approaches T_eff, saturating the kernel and weakening
-        the adaptive shrinkage.  Use only when n/T_eff ≲ 0.5; the marginal
-        default is the concentration-robust choice at every dimension.
-    lambda_corr_fast : float or None
-        If set, enables score-driven memory: the correlation decay becomes
-        λ_t = lambda_corr + (lambda_corr_fast − lambda_corr)·w_t, shortening
-        the memory on high-weight (stress) days.  PSD is preserved.  Pass
-        ``None`` (default) for the published constant-λ behaviour.
-        Do not combine with ``weight_statistic='mahalanobis'`` — the two
-        mechanisms act on the same reactivity channel and their combination
-        degraded out-of-sample accuracy in testing.
-    vol_anchor_phi : float or None
-        If set, enables the OU volatility anchor: each asset's variance
-        prediction mean-reverts toward a slow per-asset anchor before the
-        measurement update, v_pred = v̄ + φ·(v − v̄), with the anchor v̄ a
-        slow EWMA of squared returns (see ``vol_anchor_decay``).  φ is the
-        per-step retention of deviations from the anchor (deviation
-        half-life ≈ ln 2 / (1 − φ) days); φ = 1 or ``None`` (default)
-        reproduces the published estimator exactly.  Recommended φ = 0.995
-        (conservative; the range [0.99, 0.995] is robust).  On the S&P-500
-        n=100 benchmark this improved held-out one-step NLL by 3.3 points
-        (φ=0.995; 4.3 at φ=0.99) and five-step NLL by 3.9 (5.0), with no
-        degradation at n=300.  Mechanism: a two-timescale (component-style)
-        volatility structure — it changes persistence, not shock response.
-        Validated with the default marginal kernel; interaction with the
-        correlation-side extensions above is untested.
-    vol_anchor_decay : float
-        Decay of the slow per-asset variance anchor (default 0.999,
-        effective memory ≈ 1000 trading days).  Only used when
-        ``vol_anchor_phi`` is set.
+        Offset of the published intensity rule ``min(1, n/2S) - delta``
+        (default 0.10); unused under ``alpha_rule='selftuning'``.
     shrinkage_target : str
-        Geometry of the adaptive shrinkage target.  ``'equicorrelation'``
-        (default) is the published single-factor target.  ``'cluster'``
-        uses the concentration-morphing cluster target
-        T = (1−α)·T_equi + α·[(1−γ)I + γ·(C∘C)], where C∘C is the Hadamard
-        square of the current correlation (PSD by the Schur product
-        theorem) and γ = min(1, ρ̄/mean-offdiag(C∘C)) level-matches the
-        target to the equicorrelation mass.  Respects the correlation
-        matrix's own block/cluster structure without any clustering
-        algorithm; adds no parameters and stays O(n²).  As α → 0 it
-        reduces exactly to the published estimator, so behaviour at low
-        concentration is unchanged.  Held-out one-step NLL on the S&P-500
-        benchmark: +0.14 (negligible) at n=100, −4.2 at n=200, −25.0 at
-        n=300.  Recommended when n approaches the effective sample size.
+        ``'equicorrelation'`` (default) or ``'cluster'`` (Hadamard-square
+        target, PSD by the Schur product theorem).
     corr_half_lives : sequence of float, optional
-        Scale-free correlation memory with surprise-gated adaptive blend
-        weights.  When set, the single correlation timescale is replaced
-        by a positive combination of EWMAs on the given geometric
-        half-life ladder (in trading days, e.g. ``(43, 173, 693)``): each
-        scale is normalised and adaptively shrunk against its own
-        effective sample size, and the resulting covariances are blended
-        with weights resting at the prior ∝ half-life\\ :sup:`corr_theta`.
-        By Bernstein's theorem the ladder approximates the power-law
-        memory of financial correlations (the streaming analogue of HAR).
-        For ladders of two or more rungs the blend weights are gated by a
-        sequential surprise detector: a two-sided Page CUSUM on the
-        studentised fast-vs-slow per-rung predictive-score drift
-        (reference drift 0.5, threshold 4.9721 = Siegmund average-run-
-        length ~2 years); an alarm applies a half-magnitude tilt of the
-        theta-prior toward the inverse-horizon vector (fast alarms,
-        w ~ 1/h) or the square-root-horizon vector (slow alarms,
-        w ~ h^0.5), decaying at the fastest rung's half-life.  Weights
-        equal the prior on all non-alarmed days and the blend stays
-        convex, so PSD is structural throughout.  The detector adds five
-        scalars of state and one Cholesky per rung per update for the
-        scores; it is validated across S&P panels (held-out +0.5-0.6
-        NLL/day over the detector-off blend), an external industry panel
-        incl. an out-of-time seal (+0.53/day, p=1e-4), a multi-asset
-        futures panel, and synthetic regime/null suites, with a
-        sign-stable one-at-a-time sensitivity sweep over all structural
-        constants.  ``None`` (default) is the published single-scale
-        estimator, bit-for-bit; a one-element ladder reduces to a
-        single-scale estimator at that half-life (no detector).
-        Mutually exclusive with ``lambda_corr_fast``; composes with
-        ``shrinkage_target='cluster'``.  Cost is O(K·n²) per update plus
-        the detector's per-rung score factorisations.  Held-out one-step
-        NLL on the S&P-500 benchmark improves on the single-scale
-        estimator at every dimension (−4.6 at n=100, −11.1 at n=300
-        before the cluster target); the $90\\%$ model confidence set
-        collapses to this configuration alone.  Recommended default: the
-        base-centred ladder ``(43, 173, 693)`` with ``corr_theta=0.25``.
+        Correlation timescale ladder in trading days, e.g. ``(43, 173,
+        693)``; ``None`` is the single-scale estimator.  Two or more rungs
+        enable the surprise detector.
     corr_theta : float
-        Long-memory exponent controlling the resting blend weights
-        (default 0.25).  Only used when ``corr_half_lives`` is set.
+        Rung-weight exponent, prior weights ∝ half-life**theta (default
+        0.25; 2.0 uses 0.5).
     min_obs : int or None
-        Usability gate for newly listed assets.  When set, the property
-        ``usable_mask`` marks an asset usable only once it has delivered
-        at least ``min_obs`` finite observations.  The gate is purely
-        diagnostic: state evolution and ``get_cov``/``get_corr`` are
-        unchanged (the states keep warming during the gated window, so an
-        asset is fully warm when the gate lifts).  Motivation: on an
-        expanding multi-asset universe, forecast rows for assets in their
-        first ~100 observations are dominated by the single-observation
-        variance initialisation and are unusable for scoring or portfolio
-        construction (measured ≈ +2,800 NLL/day on days whose scored set
-        included such assets).  Deployment recipe::
-
-            m = est.usable_mask
-            cov_usable = est.get_cov()[np.ix_(m, m)]
-
-        Recommended ``min_obs`` ≈ 60–100 for daily data.  ``None``
-        (default) disables the gate (``usable_mask`` is all-True).
+        Diagnostic usability gate: ``usable_mask`` marks assets with at
+        least ``min_obs`` observations; estimates are unaffected.
+    kappa_mode : str
+        ``'fixed'`` (default) or ``'adaptive'``: kernel scale as state,
+        ``kappa_t = EWMA(activity) / 3`` at the median rung's half-life.
+    alpha_rule : str
+        ``'published'`` (default), ``'selftuning'`` (intensity from the
+        online concentration and de-noised market fit) or
+        ``'selftuning-target'`` (target-family fit variant).
+    level_match : bool
+        Level-match the cluster target (default True; 2.0 uses False,
+        the pure Schur-square target).
+    detector : bool
+        Surprise-gated rung weights when a ladder is configured (default
+        True).
+    clock : str
+        ``'global'`` (default) or ``'asset'``: per-asset market clocks from
+        the correlation neighbourhood, with the PSD diagonal-congruence
+        rung update.
 
     Examples
     --------
@@ -295,7 +198,6 @@ class SqueezeKernelEstimator:
     >>> for r_t in returns:
     ...     est.update(r_t)
     >>> cov = est.get_cov()
-    >>> corr = est.get_corr()
     """
 
     def __init__(
@@ -304,18 +206,10 @@ class SqueezeKernelEstimator:
         *,
         lambda_vol: float = 0.98,
         lambda_corr: float = 0.996,
-        kappa: float | None = None,
-        kernel_fn: KernelFn | None = None,
-        kernel_kwargs: dict[str, object] | None = None,
+        kappa: float = 0.25,
         epsilon: float = 1e-8,
         shrinkage: str | float = "auto",
         shrinkage_delta: float = 0.10,
-        impute_missing: bool = False,
-        impute_threshold: float = 0.6,
-        weight_statistic: str = "marginal",
-        lambda_corr_fast: float | None = None,
-        vol_anchor_phi: float | None = None,
-        vol_anchor_decay: float = 0.999,
         shrinkage_target: str = "equicorrelation",
         corr_half_lives: "Sequence[float] | None" = None,
         corr_theta: float = 0.25,
@@ -330,23 +224,10 @@ class SqueezeKernelEstimator:
         self.lambda_vol = lambda_vol
         self.lambda_corr = lambda_corr
         self.epsilon = epsilon
-        self.impute_missing = impute_missing
-        self.impute_threshold = impute_threshold
         self.shrinkage_delta = shrinkage_delta
-
-        # Opt-in extensions (defaults preserve the published estimator exactly)
-        if weight_statistic not in ("marginal", "mahalanobis"):
-            raise ValueError("weight_statistic must be 'marginal' or 'mahalanobis'.")
-        self.weight_statistic = weight_statistic
-        if lambda_corr_fast is not None and not (0.0 < lambda_corr_fast < 1.0):
-            raise ValueError("lambda_corr_fast must be in (0, 1).")
-        self.lambda_corr_fast = lambda_corr_fast
-        if vol_anchor_phi is not None and not (0.0 < vol_anchor_phi <= 1.0):
-            raise ValueError("vol_anchor_phi must be in (0, 1].")
-        if not (0.0 < vol_anchor_decay < 1.0):
-            raise ValueError("vol_anchor_decay must be in (0, 1).")
-        self.vol_anchor_phi = vol_anchor_phi
-        self.vol_anchor_decay = vol_anchor_decay
+        if kappa <= 0.0:
+            raise ValueError("kappa must be > 0.")
+        self.kappa = float(kappa)
         if shrinkage_target not in ("equicorrelation", "cluster"):
             raise ValueError("shrinkage_target must be 'equicorrelation' or 'cluster'.")
         self.shrinkage_target = shrinkage_target
@@ -373,8 +254,6 @@ class SqueezeKernelEstimator:
             raise ValueError("clock must be 'global' or 'asset'.")
         if clock == "asset" and corr_half_lives is None:
             raise ValueError("clock='asset' requires the correlation ladder.")
-        if clock == "asset" and weight_statistic != "marginal":
-            raise ValueError("clock='asset' supports weight_statistic='marginal'.")
         self.clock = clock
         self.kappa_mode = kappa_mode
         self.alpha_rule = alpha_rule
@@ -419,11 +298,6 @@ class SqueezeKernelEstimator:
                 raise ValueError("corr_half_lives must be a non-empty sequence of positive half-lives.")
             if corr_theta < 0.0:
                 raise ValueError("corr_theta must be >= 0.")
-            if lambda_corr_fast is not None:
-                raise ValueError(
-                    "corr_half_lives and lambda_corr_fast are mutually exclusive "
-                    "correlation-memory mechanisms; set at most one."
-                )
             self.corr_half_lives = hl
             self._corr_lam = 2.0 ** (-1.0 / hl)
             w = hl ** corr_theta
@@ -445,10 +319,6 @@ class SqueezeKernelEstimator:
         else:
             self._shrinkage_alpha = float(shrinkage)
 
-        # Resolve kernel
-        self._kernel_fn, self._kernel_kwargs = _resolve_kernel(kappa, kernel_fn, kernel_kwargs)
-        self.kappa = self._kernel_kwargs.get("kappa") if self._kernel_fn is kernel_fisher else None
-
         # State. The correlation memory is stored NORMALISED: Q_t = M_t / S_t
         # with the recursion Q_t = (1 - eta_t) Q_{t-1} + eta_t z_t z_t',
         # eta_t = w_t / S_t after S_t <- lam S_{t-1} + w_t. This is
@@ -457,7 +327,6 @@ class SqueezeKernelEstimator:
         # PSD convex-combination recursion explicit.
         self._var_t: np.ndarray | None = None
         self._var_init: np.ndarray | None = None
-        self._var_anchor: np.ndarray | None = None
         self._vol_t: np.ndarray | None = None
         # No single-scale state is allocated in ladder mode.
         self._Q_t = (np.eye(n_assets, dtype=np.float64)
@@ -522,41 +391,17 @@ class SqueezeKernelEstimator:
             var_init = np.zeros(n, dtype=bool)
             self._var_t = var_t
             self._var_init = var_init
-            if self.vol_anchor_phi is not None:
-                self._var_anchor = np.zeros(n, dtype=np.float64)
 
         first = finite & ~var_init
         repeat = finite & var_init
         if np.any(first):
             var_t[first] = r_t[first] ** 2 + eps
             var_init[first] = True
-            if self._var_anchor is not None:
-                self._var_anchor[first] = var_t[first]
         if np.any(repeat):
-            if self.vol_anchor_phi is None:
-                var_t[repeat] = (
-                    self.lambda_vol * var_t[repeat]
-                    + (1.0 - self.lambda_vol) * r_t[repeat] ** 2
-                )
-            else:
-                # OU anchor: mean-revert the variance prediction toward a slow
-                # per-asset anchor before the measurement update, then update
-                # the anchor itself (order matters and matches the validated
-                # experiment: prediction uses the *old* anchor).
-                var_anchor = self._var_anchor
-                assert var_anchor is not None
-                # allocated together with the anchor on the first update
-                phi = self.vol_anchor_phi
-                lam_bar = self.vol_anchor_decay
-                anchor = var_anchor[repeat]
-                v_pred = anchor + phi * (var_t[repeat] - anchor)
-                var_t[repeat] = (
-                    self.lambda_vol * v_pred
-                    + (1.0 - self.lambda_vol) * r_t[repeat] ** 2
-                )
-                var_anchor[repeat] = (
-                    lam_bar * anchor + (1.0 - lam_bar) * r_t[repeat] ** 2
-                )
+            var_t[repeat] = (
+                self.lambda_vol * var_t[repeat]
+                + (1.0 - self.lambda_vol) * r_t[repeat] ** 2
+            )
 
         vol_t = np.zeros(n, dtype=np.float64)
         vol_t[var_init] = np.sqrt(var_t[var_init])
@@ -575,29 +420,10 @@ class SqueezeKernelEstimator:
                                    + (1.0 - self._kap_lam) * d2)
                 w_t = d2 / (d2 + kappa_t)
                 self._last_kappa = kappa_t
-            elif self.weight_statistic == "mahalanobis" and self._vol_t is not None:
-                # Score-exact surprise against the estimator's own previous
-                # correlation; falls back to the marginal d² on the first
-                # step or a (rare) singular observed submatrix. Extraction is
-                # lazy, so bring _corr up to the t-1 state first.
-                if self._dirty:
-                    self._materialize()
-                corr_prev = self._corr
-                assert corr_prev is not None   # _materialize always sets it
-                try:
-                    c_sub = corr_prev[np.ix_(finite, finite)]
-                    d2 = float(z_t[finite] @ np.linalg.solve(c_sub, z_t[finite])) / n_obs
-                except np.linalg.LinAlgError:
-                    pass
-                w_t = self._kernel_fn(d2, n_observed=n_obs, **self._kernel_kwargs)
             else:
-                w_t = self._kernel_fn(d2, n_observed=n_obs, **self._kernel_kwargs)
+                w_t = kernel_fisher(d2, kappa=self.kappa)
         else:
             w_t = 0.0
-
-        # ── Imputation ──
-        if self.impute_missing and 0 < n_obs < n:
-            self._impute(z_t, finite)
 
         add = w_t > 0.0 and n_obs > 0
         if add:
@@ -611,10 +437,6 @@ class SqueezeKernelEstimator:
             Q_t = self._Q_t
             assert Q_t is not None     # the single-scale state exists exactly
             lam_c = self.lambda_corr   # when the ladder is not configured
-            if self.lambda_corr_fast is not None:
-                # Score-driven memory: stress days (w_t → 1) shorten the memory
-                # toward lambda_corr_fast; calm days keep the slow decay.
-                lam_c = self.lambda_corr + (self.lambda_corr_fast - self.lambda_corr) * w_t
             self._S_t = lam_c * self._S_t + w_t
             if add:
                 # Q <- (1 - eta) Q + eta zz'. With w_t = 0 both S and M decay
@@ -730,56 +552,7 @@ class SqueezeKernelEstimator:
         n = self.n_assets
         return max(0.0, min(1.0, n / (2.0 * max(self._S_t, self.epsilon)) - self.shrinkage_delta))
 
-    @staticmethod
-    def calibrate_kappa(
-        returns: ArrayLike, target_weight: float = 0.5, lambda_vol: float = 0.98,
-    ) -> float:
-        """Calibrate κ from burn-in data so E[w_t] ≈ target_weight.
-
-        Parameters
-        ----------
-        returns : array-like, shape (T, n)
-            Burn-in return data.
-        target_weight : float
-            Target average kernel weight in (0, 1).
-        lambda_vol : float
-            Volatility decay factor used for standardization.
-
-        Returns
-        -------
-        float
-            Calibrated κ value.
-        """
-        d2 = extract_d2_series(returns, lambda_vol=lambda_vol)
-        return calibrate_kappa(d2, target_weight)
-
     # ── Private helpers ───────────────────────────────────────────────────
-
-    def _impute(self, z_t: np.ndarray, finite: np.ndarray) -> None:
-        if self._Q_t is None:
-            # Ladder mode: imputation reads the single-scale state, which
-            # was never updated on this path — historically a silent no-op
-            # (all correlations below threshold); keep it an explicit one.
-            return
-        eps = self.epsilon
-        sigma_z = self._Q_t
-        diag_z = np.diag(sigma_z)
-        inv_diag = 1.0 / np.sqrt(np.maximum(diag_z, eps))
-        missing = ~finite
-        for i in range(self.n_assets):
-            if not missing[i]:
-                continue
-            num = den = 0.0
-            for j in range(self.n_assets):
-                if not finite[j]:
-                    continue
-                c_ij = sigma_z[i, j] * inv_diag[i] * inv_diag[j]
-                if abs(c_ij) < self.impute_threshold:
-                    continue
-                num += c_ij * z_t[j]
-                den += abs(c_ij)
-            if den > 0.0:
-                z_t[i] = num / den
 
     def _shrunk_corr_from_Q(self, Q: np.ndarray, S_t: float,
                             J_t: float | None = None) -> np.ndarray:
@@ -894,19 +667,21 @@ class SqueezeKernelEstimator:
         J_list = self._J_list
         assert J_list is not None
         K = corr_lam.size
-        if self.clock == "asset" and self._corr_blend_buf is None:
-            self._corr_blend_buf = np.empty((K, self.n_assets, self.n_assets))
+        buf = self._corr_blend_buf
+        if self.clock == "asset" and buf is None:
+            buf = np.empty((K, self.n_assets, self.n_assets))
+            self._corr_blend_buf = buf
         for k in range(K):
             corr_k = self._shrunk_corr_from_Q(Q_list[k], S_list[k], J_list[k])
-            if self.clock == "asset":
-                self._corr_blend_buf[k][:] = corr_k
+            if buf is not None:
+                buf[k][:] = corr_k
             sig_k.append(corr_k * vv)
         detector.record(sig_k)
         w = detector.blend(corr_w)
-        if self.clock == "asset":
+        if buf is not None:
             # next day's neighborhood weighting: the emitted blend of the
             # shrunk rung correlations
-            self._C_prev = np.tensordot(w, self._corr_blend_buf, axes=1)
+            self._C_prev = np.tensordot(w, buf, axes=1)
         cov = w[0] * sig_k[0]
         for k in range(1, len(sig_k)):
             cov = cov + w[k] * sig_k[k]
@@ -970,33 +745,3 @@ class SqueezeKernelEstimator:
         self._dirty = False
 
 
-# ── Kernel resolution ─────────────────────────────────────────────────────────
-
-def _resolve_kernel(
-    kappa: float | None,
-    kernel_fn: KernelFn | None,
-    kernel_kwargs: dict[str, object] | None,
-) -> tuple[KernelFn, dict[str, object]]:
-    kw = dict(kernel_kwargs) if kernel_kwargs else {}
-
-    if kernel_fn is not None:
-        if kappa is not None:
-            raise ValueError(
-                "Pass kernel-specific parameters via kernel_kwargs when kernel_fn is set."
-            )
-        return kernel_fn, kw
-
-    if "kappa" in kw and kappa is not None:
-        raise ValueError("Pass kappa either as a top-level argument or in kernel_kwargs, not both.")
-
-    if "kappa" in kw:
-        kappa_src = kw["kappa"]
-        if isinstance(kappa_src, bool) or not isinstance(kappa_src, (int, float)):
-            raise ValueError("kappa in kernel_kwargs must be a number.")
-        resolved_kappa = float(kappa_src)
-    else:
-        resolved_kappa = 0.25 if kappa is None else float(kappa)
-    if resolved_kappa <= 0.0:
-        raise ValueError("kappa must be > 0.")
-    kw["kappa"] = resolved_kappa
-    return kernel_fisher, kw

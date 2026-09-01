@@ -27,7 +27,7 @@ The published v1 estimator (all legacy knobs) remains available as
 
 from squeeze_kernel.core import CONSTANTS, SqueezeKernel, StructuralConstants
 from squeeze_kernel.estimator import SqueezeKernelEstimator
-from squeeze_kernel.kernels import kernel_fisher, kernel_exponential, kernel_chi2_cdf
+from squeeze_kernel.kernels import kernel_fisher
 from squeeze_kernel.batch import estimate_squeeze_cov
 
 __all__ = [
@@ -37,8 +37,6 @@ __all__ = [
     "SqueezeKernelEstimator",
     "estimate_squeeze_cov",
     "kernel_fisher",
-    "kernel_exponential",
-    "kernel_chi2_cdf",
 ]
 
 __version__ = "2.0.0"
