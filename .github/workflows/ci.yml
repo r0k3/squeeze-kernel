@@ -40,6 +40,12 @@ jobs:
         run: uv run mypy
 
       - name: Run tests
+        # single-threaded BLAS: the goldens pin long recursions whose
+        # last digits depend on reduction order under threaded BLAS
+        env:
+          OPENBLAS_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
         run: uv run python -m pytest
 
   build:

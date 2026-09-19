@@ -28,9 +28,9 @@ def test_golden_path(name):
         est.update(r)
         if t == t_mid:
             cov_mid = est.get_cov()
-    np.testing.assert_allclose(cov_mid, ref["cov_mid"], rtol=1e-10, atol=1e-14)
-    np.testing.assert_allclose(est.get_cov(), ref["cov_final"], rtol=1e-10, atol=1e-14)
-    np.testing.assert_allclose(est.get_corr(), ref["corr_final"], rtol=1e-10, atol=1e-12)
+    np.testing.assert_allclose(cov_mid, ref["cov_mid"], rtol=1e-8, atol=1e-10)
+    np.testing.assert_allclose(est.get_cov(), ref["cov_final"], rtol=1e-8, atol=1e-10)
+    np.testing.assert_allclose(est.get_corr(), ref["corr_final"], rtol=1e-8, atol=1e-10)
 
 
 @pytest.mark.parametrize("name", list(SCENARIOS))
@@ -45,9 +45,9 @@ def test_promoted_golden_path(name):
         est.update(r)
         if t == t_mid:
             cov_mid = est.get_cov()
-    np.testing.assert_allclose(cov_mid, ref["cov_mid"], rtol=1e-10, atol=1e-14)
-    np.testing.assert_allclose(est.get_cov(), ref["cov_final"], rtol=1e-10, atol=1e-14)
-    np.testing.assert_allclose(est.get_corr(), ref["corr_final"], rtol=1e-10, atol=1e-12)
+    np.testing.assert_allclose(cov_mid, ref["cov_mid"], rtol=1e-8, atol=1e-10)
+    np.testing.assert_allclose(est.get_cov(), ref["cov_final"], rtol=1e-8, atol=1e-10)
+    np.testing.assert_allclose(est.get_corr(), ref["corr_final"], rtol=1e-8, atol=1e-10)
 
 
 @pytest.mark.parametrize("name", list(SCENARIOS))
@@ -62,6 +62,6 @@ def test_split_golden_path(name):
         est.update(r)
         if t == t_mid:
             cov_mid = est.get_cov()
-    np.testing.assert_allclose(cov_mid, ref["cov_mid"], rtol=1e-10, atol=1e-14)
-    np.testing.assert_allclose(est.get_cov(), ref["cov_final"], rtol=1e-10, atol=1e-14)
-    np.testing.assert_allclose(est.get_corr(), ref["corr_final"], rtol=1e-10, atol=1e-12)
+    np.testing.assert_allclose(cov_mid, ref["cov_mid"], rtol=1e-8, atol=1e-10)
+    np.testing.assert_allclose(est.get_cov(), ref["cov_final"], rtol=1e-8, atol=1e-10)
+    np.testing.assert_allclose(est.get_corr(), ref["corr_final"], rtol=1e-8, atol=1e-10)
