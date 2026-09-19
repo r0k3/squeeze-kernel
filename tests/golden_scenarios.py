@@ -20,6 +20,28 @@ ESTIMATOR_KWARGS = dict(
     shrinkage_target="cluster",
 )
 
+# The 3.0 promoted configuration (what ``SqueezeKernel(lam)`` builds): the
+# self-adapting volatility ladder and the blend-gradient mixture.  Pinned
+# separately so the 2.x golden paths above stay bit-for-bit.
+PROMOTED_KWARGS = dict(
+    corr_half_lives=[43.25, 173.0, 692.0],
+    corr_theta=0.5,
+    shrinkage="auto",
+    shrinkage_target="cluster",
+    kappa_mode="adaptive",
+    alpha_rule="selftuning",
+    level_match=False,
+    detector=True,
+    clock="asset",
+    vol_ladder=True,
+    weights="eg_blend",
+)
+
+# The 3.1 candidate: the promoted configuration with the learned shrinkage
+# split (each timescale's raw / equicorrelation / Schur-square experts
+# weighted by the blend gradient from the intensity rule's prior).
+SPLIT_KWARGS = dict(PROMOTED_KWARGS, split_learn=True)
+
 
 def _block_returns(rng, t, within=0.6, cross=0.0):
     """Two 20-asset blocks with the given within/cross correlations."""

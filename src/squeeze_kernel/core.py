@@ -11,9 +11,21 @@ Configuration (research record: squeeze_cov V2_STATUS.md, branch v2):
 - correlation ladder at ``half_life * (43/173, 1, 693/173)`` — the
   canonical rungs at the default half-life; rung weights ``pi ~ sqrt(h)``
   (theta = 1/2, structural),
-- volatility EWMA at ``lambda_vol = 0.98`` — the single remaining
-  empirically frozen constant (the ``h/b`` derivation is falsified by
-  crisis sub-periods; see the paper's intensity section),
+- volatility on a ladder at ``half_life * (1/16, 1/4, 1)``, pooled
+  panel-wide by Bayes at the null-calibrated temperature on saturated
+  evidence with the fastest rung's memory and a uniform prior; this
+  replaced the 2.x fitted constant ``lambda_vol = 0.98`` (still accepted
+  by ``SqueezeKernelEstimator`` and ignored when ``vol_ladder=True``),
+- timescale weights moved by exponentiated gradient on the blend's log
+  score at the null temperature (fast-rung memory) from the prior
+  ``pi ~ sqrt(h)``; replaced the 2.x CUSUM detector,
+- (3.1) each timescale's shrunk correlation is a learned convex
+  combination of three PSD unit-diagonal experts -- its raw
+  correlation, the equicorrelation matrix at its mean level, and its
+  Schur square -- whose prior is the intensity rule's morph
+  ``(1-a, a(1-a), a^2)`` and whose weights the same blend gradient
+  corrects online (studentised within the timescale, same temperature
+  and memory).  At the prior the estimator is the 3.0 one,
 - kernel scale as state, not parameter: ``kappa_t = (1/3) EWMA_h(d^2)``
   (chi-squared-null constant),
 - self-tuning shrinkage intensity per rung from the online concentration
@@ -31,7 +43,7 @@ from dataclasses import dataclass
 import numpy as np
 from numpy.typing import ArrayLike
 
-from .estimator import SqueezeKernelEstimator
+from .estimator import SqueezeKernelEstimator, _BlendGradient
 
 __all__ = ["SqueezeKernel", "StructuralConstants", "CONSTANTS"]
 
@@ -45,7 +57,7 @@ class StructuralConstants:
 
     b: float = 4.0                  # ladder spacing: rungs (h/b, h, h*b)
     theta: float = 0.5              # rung weights ~ h^theta
-    lambda_vol: float = 0.98        # frozen empirical (not derived from h)
+    lambda_vol: float = 0.98        # 2.x constant; unused by the 3.0 front-end (vol ladder)
     kappa_c: float = 1.0 / 3.0      # kernel scale: kappa = kappa_c * EWMA(activity)
     schur_p: int = 2                # Hadamard power of the cluster target
     epsilon: float = 1e-8
@@ -106,6 +118,9 @@ class SqueezeKernel:
             level_match=False,
             detector=True,
             clock="asset",
+            vol_ladder=True,
+            weights="eg_blend",
+            split_learn=True,
             epsilon=c.epsilon,
         )
 
@@ -161,6 +176,7 @@ class SqueezeKernel:
             "rung_S": S,
             "rung_nu": nu,
             "detector_tilt": 0.0 if det is None else det.tilt,
+            "split": det.v.copy() if isinstance(det, _BlendGradient) and det.split else None,
         }
 
     # ── v1 escape hatch ──────────────────────────────────────────────────

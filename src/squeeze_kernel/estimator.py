@@ -128,6 +128,206 @@ class _SurpriseDetector:
         return np.asarray((1.0 + t) * prior + (-t) * self.pi_slow)
 
 
+class _BlendGradient:
+    """Exponentiated gradient on the BLEND's log score, at the
+    null-calibrated temperature.
+
+    The emitted covariance is the linear pool Sigma(w) = sum_k w_k Sigma_k
+    of the rung covariances.  Its Gaussian log score has gradient
+
+        d ell / d w_k = -1/2 tr(Sigma^-1 Sigma_k) + 1/2 u' Sigma_k u,
+        u = Sigma^-1 r,
+
+    so the update moves the blend rather than selecting a rung (Bayesian
+    model averaging over rung likelihoods selects, and collapses).  The
+    gradient is studentised across rungs by its running rms and scaled by
+    sqrt(2 eps), eps the fixed-share rate: the accumulated log-odds then
+    have unit variance under uninformative evidence, so the mixture stays
+    within a factor e of its prior when there is nothing to learn and
+    moves linearly in a persistent advantage.  Evidence memory: the
+    fastest rung (a regime can change as fast as the fastest rung can
+    follow).  State: the weights, one scalar scale, and the cached rung
+    covariances of the previous step.  Causal: ``score`` reads the
+    previous step's covariances, ``advance`` updates the weights used for
+    the next blend.
+    """
+
+    _JITTER = 1e-12
+
+    def __init__(self, half_lives: np.ndarray, prior: np.ndarray,
+                 split: bool = False, n_experts: int = 3) -> None:
+        hl = np.asarray(half_lives, dtype=np.float64)
+        self.prior = np.asarray(prior, dtype=np.float64)
+        self.w = self.prior.copy()
+        self.eps = float(1.0 - 2.0 ** (-1.0 / float(hl.min())))
+        self._gamma_scale = 2.0 ** (-1.0 / float(np.median(hl)))
+        self.scale = 1.0
+        self.prev_sig: list[np.ndarray] | None = None
+        self.prev_w: np.ndarray | None = None
+        # Learned shrinkage split (3.1): each timescale's correlation is a
+        # convex combination of three PSD unit-diagonal experts -- raw,
+        # equicorrelation at its mean level, Schur square -- whose prior
+        # is the intensity rule's morph (1-a, a(1-a), a^2) and whose
+        # weights are moved by the same gradient step as the timescale
+        # weights, studentised within the timescale.  Starts uniform and
+        # forgets toward the prior at the fixed-share rate.
+        self.split = bool(split)
+        self.n_experts = int(n_experts)
+        self.v = np.full((hl.size, self.n_experts), 1.0 / self.n_experts)
+        self.scale_v = np.ones(hl.size)
+        self.prev_comps: list[tuple[np.ndarray, ...]] | None = None
+        self.prev_prior: np.ndarray | None = None
+        self.prev_cov: np.ndarray | None = None
+        self.prev_vol: np.ndarray | None = None
+        self.prev_v: np.ndarray | None = None
+        self._gc: np.ndarray | None = None
+
+    def score(self, r_t: np.ndarray, finite: np.ndarray) -> np.ndarray | None:
+        """Gradient of the previous blend's log score at ``r_t`` (observed
+        subvector), one entry per rung; ``None`` on a degenerate day."""
+        if self.prev_sig is None or self.prev_w is None:
+            return None
+        idx = np.flatnonzero(finite)
+        if idx.size < 2:
+            return None
+        K = len(self.prev_sig)
+        full = idx.size == self.prev_sig[0].shape[0]
+        # Gate exactly as the research engine does: the day counts only if
+        # every rung's observed sub-block is positive definite (a newly
+        # listed asset enters with a zero row and fails this); otherwise
+        # the mixture keeps its weights for the day.  With the split the
+        # rung matrices held here are correlations (vol > 0 on observed
+        # assets, so PD of the correlation block <=> PD of the covariance).
+        for k in range(K):
+            sub = self.prev_sig[k] if full else self.prev_sig[k][np.ix_(idx, idx)]
+            if not self.split:
+                sub = 0.5 * (sub + sub.T)
+            try:
+                if _cho_factor is not None:
+                    _cho_factor(sub, lower=True, check_finite=False)
+                else:
+                    np.linalg.cholesky(sub)
+            except (np.linalg.LinAlgError, ValueError):
+                return None
+        if self.split:
+            prev_vol, prev_cov = self.prev_vol, self.prev_cov
+            assert prev_vol is not None and prev_cov is not None
+            # an asset observed today but without a variance state at the
+            # forecast has a zero covariance row: abstain, as the covariance
+            # factorisation did
+            if not full and np.any(prev_vol[idx] <= 0.0):
+                return None
+            sig = prev_cov if full else prev_cov[np.ix_(idx, idx)]
+            sig = 0.5 * (sig + sig.T)
+        else:
+            sig = np.zeros((idx.size, idx.size))
+            for k in range(K):
+                sig += self.prev_w[k] * self.prev_sig[k][np.ix_(idx, idx)]
+            sig = 0.5 * (sig + sig.T)
+        # Floor the spectrum before factorising, exactly as the research
+        # engine's scoring path does: a near-singular early blend would
+        # otherwise hand the running scale one enormous gradient and
+        # silence the mixer for years.
+        min_eig = float(np.linalg.eigvalsh(sig).min())
+        if min_eig < 1e-8:
+            sig = sig + np.eye(idx.size) * (1e-8 - min_eig)
+        try:
+            if _cho_factor is not None:
+                cf = _cho_factor(sig, lower=True, check_finite=False)
+                u = _cho_solve(cf, r_t[idx], check_finite=False)
+                sinv = _cho_solve(cf, np.eye(idx.size), check_finite=False)
+            else:
+                sinv = np.linalg.inv(sig)
+                u = sinv @ r_t[idx]
+        except (np.linalg.LinAlgError, ValueError):
+            return None
+        g = np.empty(K)
+        self._gc = None
+        if self.split and self.prev_comps is not None:
+            prev_comps, prev_vol, prev_v = self.prev_comps, self.prev_vol, self.prev_v
+            assert prev_vol is not None and prev_v is not None
+            # Gradients on the expert CORRELATIONS:
+            #   tr(Sinv (T o vv)) = sum((Sinv o vv) * T),
+            #   u'(T o vv) u = (u o s)' T (u o s);
+            # the rung gradient follows by linearity of the pool.
+            vo = prev_vol if full else prev_vol[idx]
+            mw = sinv * np.multiply.outer(vo, vo)
+            ut = u * vo
+            J = self.n_experts
+            gc = np.empty((K, J))
+            for k in range(K):
+                for j in range(J):
+                    t_ = prev_comps[k][j]
+                    ts = t_ if full else t_[np.ix_(idx, idx)]
+                    gc[k, j] = -0.5 * float((mw * ts).sum()) + 0.5 * float(ut @ ts @ ut)
+                g[k] = float(prev_v[k] @ gc[k])
+            if not np.all(np.isfinite(g)):
+                return None
+            self._gc = gc
+            return g
+        for k in range(K):
+            sk = self.prev_sig[k][np.ix_(idx, idx)]
+            g[k] = -0.5 * float((sinv * sk).sum()) + 0.5 * float(u @ sk @ u)
+        if not np.all(np.isfinite(g)):
+            return None
+        return g
+
+    def advance(self, g: np.ndarray | None) -> None:
+        if g is not None:
+            dd = g - g.mean()
+            rms = float(np.sqrt((dd @ dd) / dd.size))
+            self.scale = (self._gamma_scale * self.scale
+                          + (1.0 - self._gamma_scale) * rms)
+            ell = (dd / (self.scale + self._JITTER)) * np.sqrt(2.0 * self.eps)
+            lw = np.log(np.maximum(self.w, 1e-300)) + ell
+            lw -= lw.max()
+            w = np.exp(lw)
+            self.w = w / w.sum()
+            if self.split and self._gc is not None and self.prev_prior is not None:
+                for k in range(self.v.shape[0]):
+                    gc = self._gc[k]
+                    if not np.all(np.isfinite(gc)):
+                        continue
+                    ddv = gc - gc.mean()
+                    rmsv = float(np.sqrt((ddv @ ddv) / float(self.n_experts)))
+                    self.scale_v[k] = (self._gamma_scale * self.scale_v[k]
+                                       + (1.0 - self._gamma_scale) * rmsv)
+                    lv = (np.log(np.maximum(self.v[k], 1e-300))
+                          + (ddv / (self.scale_v[k] + self._JITTER)) * np.sqrt(2.0 * self.eps))
+                    lv -= lv.max()
+                    vk = np.exp(lv)
+                    vk /= vk.sum()
+                    self.v[k] = (1.0 - self.eps) * vk + self.eps * self.prev_prior[k]
+        self.w = (1.0 - self.eps) * self.w + self.eps * self.prior
+
+    def record(self, rung_covs: list[np.ndarray],
+               comps: list[tuple[np.ndarray, ...]] | None = None,
+               prior: np.ndarray | None = None,
+               cov: np.ndarray | None = None,
+               vol: np.ndarray | None = None) -> None:
+        """Cache this step's forecast for next step's ``score``.  Without
+        the split: the rung covariances and the weights that blend them.
+        With the split: the rung CORRELATIONS (mixed), the expert
+        correlations, the rule's prior split, the emitted covariance and
+        the volatility vector; nothing per expert is materialised."""
+        self.prev_sig = rung_covs
+        self.prev_w = self.w.copy()
+        self.prev_comps = comps
+        self.prev_prior = None if prior is None else prior.copy()
+        self.prev_cov = cov
+        self.prev_vol = vol
+        self.prev_v = self.v.copy()
+
+    def blend(self, prior: np.ndarray) -> np.ndarray:
+        return np.asarray(self.w)
+
+    @property
+    def tilt(self) -> float:
+        """Diagnostic analogue of the CUSUM tilt: signed departure of the
+        blend from its prior toward the fast (+) or slow (-) rung."""
+        return float(self.w[0] - self.prior[0] - (self.w[-1] - self.prior[-1]))
+
+
 class SqueezeKernelEstimator:
     """The Squeeze Kernel estimator with its full switch surface.
 
@@ -219,8 +419,18 @@ class SqueezeKernelEstimator:
         level_match: bool = True,
         detector: bool = True,
         clock: str = "global",
+        vol_ladder: bool = False,
+        weights: str = "cusum",
+        split_learn: bool = False,
     ):
         self.n_assets = n_assets
+        if weights not in ("cusum", "eg_blend"):
+            raise ValueError("weights must be 'cusum' or 'eg_blend'.")
+        self.weights = weights
+        if split_learn and weights != "eg_blend":
+            raise ValueError("split_learn requires weights='eg_blend'.")
+        self.split_learn = bool(split_learn)
+        self.vol_ladder = bool(vol_ladder)
         self.lambda_vol = lambda_vol
         self.lambda_corr = lambda_corr
         self.epsilon = epsilon
@@ -288,7 +498,7 @@ class SqueezeKernelEstimator:
         self.corr_theta = corr_theta
         self._corr_lam: np.ndarray | None = None
         self._corr_w: np.ndarray | None = None
-        self._detector: _SurpriseDetector | None = None
+        self._detector: _SurpriseDetector | _BlendGradient | None = None
         self._Q_list: list[np.ndarray] | None = None
         self._S_list: list[float] | None = None
         self._adaptive = False
@@ -311,7 +521,10 @@ class SqueezeKernelEstimator:
             # weights; the v2 ablation switch).
             self._adaptive = detector and hl.size >= 2
             if self._adaptive:
-                self._detector = _SurpriseDetector(hl)
+                self._detector = (_BlendGradient(hl, self._corr_w, split=self.split_learn,
+                                                 n_experts=2 if shrinkage_target == "equicorrelation" else 3)
+                                  if weights == "eg_blend"
+                                  else _SurpriseDetector(hl))
 
         # Resolve shrinkage
         if isinstance(shrinkage, str):
@@ -328,6 +541,24 @@ class SqueezeKernelEstimator:
         self._var_t: np.ndarray | None = None
         self._var_init: np.ndarray | None = None
         self._vol_t: np.ndarray | None = None
+        # Self-adapting volatility memory: a ladder of decays two octaves
+        # below the correlation ladder, pooled with panel-wide weights that
+        # are Bayes at the null-calibrated temperature on SATURATED
+        # (tanh) evidence -- one day cannot hand a stale rung weeks of
+        # weight -- with the fastest rung's memory and a uniform prior.
+        # Replaces the fitted constant ``lambda_vol``.
+        self._var_l: np.ndarray | None = None
+        if self.vol_ladder:
+            if self.corr_half_lives is None:
+                raise ValueError("vol_ladder requires corr_half_lives.")
+            h = float(np.median(self.corr_half_lives))
+            self._hl_v = np.array([h / 16.0, h / 4.0, h])
+            self._lv_l = 2.0 ** (-1.0 / self._hl_v)
+            self._eps_v = float(1.0 - self._lv_l[0])
+            self._pi_v = np.full(3, 1.0 / 3.0)
+            self._gamma_v = 2.0 ** (-1.0 / h)
+            self._w_p = self._pi_v.copy()
+            self._scale_p = 1.0
         # No single-scale state is allocated in ladder mode.
         self._Q_t = (np.eye(n_assets, dtype=np.float64)
                      if self._corr_lam is None else None)
@@ -397,11 +628,36 @@ class SqueezeKernelEstimator:
         if np.any(first):
             var_t[first] = r_t[first] ** 2 + eps
             var_init[first] = True
+            if self.vol_ladder:
+                if self._var_l is None:
+                    self._var_l = np.full((3, n), eps)
+                self._var_l[:, first] = r_t[first] ** 2 + eps
         if np.any(repeat):
-            var_t[repeat] = (
-                self.lambda_vol * var_t[repeat]
-                + (1.0 - self.lambda_vol) * r_t[repeat] ** 2
-            )
+            if self.vol_ladder:
+                assert self._var_l is not None
+                r2 = r_t[repeat] ** 2
+                vr = self._var_l[:, repeat]
+                vr_safe = np.maximum(vr, eps)
+                ell_v = -0.5 * (np.log(vr_safe) + r2 / vr_safe)
+                ep = ell_v.sum(axis=1)
+                dp = ep - ep.mean()
+                rp = float(np.sqrt((dp @ dp) / 3.0))
+                self._scale_p = (self._gamma_v * self._scale_p
+                                 + (1.0 - self._gamma_v) * rp)
+                zp = np.tanh(dp / (self._scale_p + 1e-12))
+                lw = np.log(np.maximum(self._w_p, 1e-300)) + zp * np.sqrt(2.0 * self._eps_v)
+                lw -= lw.max()
+                w_p = np.exp(lw)
+                w_p /= w_p.sum()
+                self._w_p = (1.0 - self._eps_v) * w_p + self._eps_v * self._pi_v
+                lv = self._lv_l[:, None]
+                self._var_l[:, repeat] = lv * vr + (1.0 - lv) * r2
+                var_t[repeat] = (self._w_p[:, None] * self._var_l[:, repeat]).sum(axis=0)
+            else:
+                var_t[repeat] = (
+                    self.lambda_vol * var_t[repeat]
+                    + (1.0 - self.lambda_vol) * r_t[repeat] ** 2
+                )
 
         vol_t = np.zeros(n, dtype=np.float64)
         vol_t[var_init] = np.sqrt(var_t[var_init])
@@ -577,6 +833,47 @@ class SqueezeKernelEstimator:
         # T = (1 - rho_bar) I + rho_bar 11'.  We avoid materialising T by
         # blending the off-diagonal toward rho_bar in place and resetting
         # the diagonal to 1.
+        alpha = self._intensity(corr, S_t, J_t)
+        if alpha > 0.0 and n > 1:
+            # Off-diagonal mean: O(n^2) sum, no mask allocation.
+            rho_bar = (corr.sum() - corr.trace()) / self._n_off
+            if self.shrinkage_target == "equicorrelation" or rho_bar <= 0.0:
+                # rho_bar <= 0 also covers the q = meanoff(C o C) = 0 corner:
+                # C o C has nonnegative entries, so q = 0 forces C = I and
+                # hence rho_bar = 0 — the equicorrelation fallback applies.
+                corr *= (1.0 - alpha)
+                corr += alpha * rho_bar
+                np.fill_diagonal(corr, 1.0)
+            else:
+                # Cluster (concentration-morphing) target:
+                #   T = (1-alpha) T_equi + alpha [(1-gamma) I + gamma (C o C)]
+                # C o C is the Hadamard square of the raw correlation (PSD by
+                # the Schur product theorem, unit diagonal for free); gamma is
+                # level-matched so the target carries the same average
+                # correlation mass as the equicorrelation target.  As
+                # alpha -> 0 this reduces exactly to the published estimator.
+                had = self._scratch_had
+                np.multiply(corr, corr, out=had)        # Hadamard square, O(n^2)
+                if self.level_match:
+                    mean_off = (had.sum() - np.trace(had)) / self._n_off
+                    gamma = min(1.0, rho_bar / max(mean_off, eps))
+                else:
+                    gamma = 1.0            # v2: pure Schur-square target
+                corr *= (1.0 - alpha)
+                corr += (alpha * (1.0 - alpha)) * rho_bar
+                had *= alpha * alpha * gamma
+                corr += had
+                np.fill_diagonal(corr, 1.0)
+        return corr
+
+    def _intensity(self, corr: np.ndarray, S_t: float,
+                   J_t: float | None = None) -> float:
+        """Shrinkage intensity of one timescale from its normalised raw
+        correlation ``corr`` and its information masses (published rule or
+        the self-tuning rule); ``corr`` is read, not modified."""
+        eps = self.epsilon
+        n = self.n_assets
+        S_t = max(S_t, eps)
         alpha = self._shrinkage_alpha
         if alpha < 0:
             if self.alpha_rule != "published" and J_t is not None:
@@ -615,37 +912,29 @@ class SqueezeKernelEstimator:
                 alpha = min(1.0, c_k) / (1.0 + r_ * r_ * s_)
             else:
                 alpha = max(0.0, min(1.0, n / (2.0 * S_t) - self.shrinkage_delta))
-        if alpha > 0.0 and n > 1:
-            # Off-diagonal mean: O(n^2) sum, no mask allocation.
-            rho_bar = (corr.sum() - corr.trace()) / self._n_off
-            if self.shrinkage_target == "equicorrelation" or rho_bar <= 0.0:
-                # rho_bar <= 0 also covers the q = meanoff(C o C) = 0 corner:
-                # C o C has nonnegative entries, so q = 0 forces C = I and
-                # hence rho_bar = 0 — the equicorrelation fallback applies.
-                corr *= (1.0 - alpha)
-                corr += alpha * rho_bar
-                np.fill_diagonal(corr, 1.0)
-            else:
-                # Cluster (concentration-morphing) target:
-                #   T = (1-alpha) T_equi + alpha [(1-gamma) I + gamma (C o C)]
-                # C o C is the Hadamard square of the raw correlation (PSD by
-                # the Schur product theorem, unit diagonal for free); gamma is
-                # level-matched so the target carries the same average
-                # correlation mass as the equicorrelation target.  As
-                # alpha -> 0 this reduces exactly to the published estimator.
-                had = self._scratch_had
-                np.multiply(corr, corr, out=had)        # Hadamard square, O(n^2)
-                if self.level_match:
-                    mean_off = (had.sum() - np.trace(had)) / self._n_off
-                    gamma = min(1.0, rho_bar / max(mean_off, eps))
-                else:
-                    gamma = 1.0            # v2: pure Schur-square target
-                corr *= (1.0 - alpha)
-                corr += (alpha * (1.0 - alpha)) * rho_bar
-                had *= alpha * alpha * gamma
-                corr += had
-                np.fill_diagonal(corr, 1.0)
-        return corr
+        return alpha
+
+    def _rung_experts(self, Q: np.ndarray, S_t: float, J_t: float
+                      ) -> tuple[tuple[np.ndarray, ...], np.ndarray]:
+        """The three PSD unit-diagonal experts of one timescale -- raw
+        correlation, equicorrelation at its mean level, Schur square --
+        and the rule's prior split (1-a, a(1-a), a^2)."""
+        eps = self.epsilon
+        n = self.n_assets
+        diag_z = np.diagonal(Q).copy()
+        inv_diag = 1.0 / np.sqrt(np.maximum(diag_z, eps))
+        corr = np.multiply.outer(inv_diag, inv_diag)
+        corr *= Q
+        np.fill_diagonal(corr, np.where(diag_z > eps, 1.0, 0.0))
+        a = self._intensity(corr, S_t, J_t)
+        rho = (corr.sum() - n) / self._n_off
+        rho = float(min(max(rho, -0.99 / max(n - 1, 1)), 0.999))
+        E = np.full((n, n), rho)
+        np.fill_diagonal(E, 1.0)
+        if self.shrinkage_target == "equicorrelation":
+            # target off: the pool is the equicorrelation shrinkage alone
+            return (corr, E), np.array([1.0 - a, a])
+        return (corr, E, corr * corr), np.array([1.0 - a, a * (1.0 - a), a * a])
 
     def _materialize_adaptive(self) -> None:
         """Adaptive-weight extraction: build per-rung shrunk covariances
@@ -671,21 +960,56 @@ class SqueezeKernelEstimator:
         if self.clock == "asset" and buf is None:
             buf = np.empty((K, self.n_assets, self.n_assets))
             self._corr_blend_buf = buf
+        comps: list[tuple[np.ndarray, ...]] | None = None
+        prior: np.ndarray | None = None
+        v: np.ndarray | None = None
+        if self.split_learn:
+            assert isinstance(detector, _BlendGradient)   # the split rides on the blend gradient
+            comps = []
+            v = detector.v
+            n_exp = 2 if self.shrinkage_target == "equicorrelation" else 3
+            if v.shape[1] != n_exp:
+                # the target was switched after construction; the split has
+                # not learned anything yet, so re-shape its state
+                assert detector.prev_comps is None, "cannot switch the target mid-stream"
+                detector.n_experts = n_exp
+                detector.v = np.full((K, n_exp), 1.0 / n_exp)
+                v = detector.v
+            prior = np.empty(v.shape)
         for k in range(K):
-            corr_k = self._shrunk_corr_from_Q(Q_list[k], S_list[k], J_list[k])
+            if self.split_learn:
+                assert comps is not None and prior is not None and v is not None
+                experts, prior[k] = self._rung_experts(Q_list[k], S_list[k], J_list[k])
+                corr_k = v[k, 0] * experts[0]
+                for j in range(1, len(experts)):
+                    corr_k = corr_k + v[k, j] * experts[j]
+                comps.append(experts)
+                sig_k.append(corr_k)          # mixed correlation; vv applied once below
+            else:
+                corr_k = self._shrunk_corr_from_Q(Q_list[k], S_list[k], J_list[k])
+                sig_k.append(corr_k * vv)
             if buf is not None:
                 buf[k][:] = corr_k
-            sig_k.append(corr_k * vv)
-        detector.record(sig_k)
         w = detector.blend(corr_w)
-        if buf is not None:
-            # next day's neighborhood weighting: the emitted blend of the
-            # shrunk rung correlations
-            self._C_prev = np.tensordot(w, buf, axes=1)
-        cov = w[0] * sig_k[0]
-        for k in range(1, len(sig_k)):
-            cov = cov + w[k] * sig_k[k]
-        cov = (cov + cov.T) * 0.5
+        if self.split_learn:
+            cb = w[0] * sig_k[0]
+            for k in range(1, K):
+                cb = cb + w[k] * sig_k[k]
+            if buf is not None:
+                self._C_prev = cb
+            cov = cb * vv
+            cov = (cov + cov.T) * 0.5
+            detector.record(sig_k, comps, prior, cov, vol_t)  # type: ignore[call-arg]
+        else:
+            detector.record(sig_k)
+            if buf is not None:
+                # next day's neighborhood weighting: the emitted blend of the
+                # shrunk rung correlations
+                self._C_prev = np.tensordot(w, buf, axes=1)
+            cov = w[0] * sig_k[0]
+            for k in range(1, len(sig_k)):
+                cov = cov + w[k] * sig_k[k]
+            cov = (cov + cov.T) * 0.5
         self._cov = cov
         d = np.sqrt(np.maximum(np.diagonal(cov), eps))
         self._corr = cov / np.outer(d, d)
