@@ -4,6 +4,7 @@
 [![PyPI](https://img.shields.io/pypi/v/squeeze-kernel.svg)](https://pypi.org/project/squeeze-kernel/)
 [![Python](https://img.shields.io/pypi/pyversions/squeeze-kernel.svg)](https://pypi.org/project/squeeze-kernel/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![DOI](https://zenodo.org/badge/1188987927.svg)](https://doi.org/10.5281/zenodo.19170801)
 
 A **streaming covariance estimator for panels of financial returns** whose entire public surface is **one number** — the decay `lam` of the anchor correlation timescale. Every other quantity is derived from it, fixed by a structural argument, or computed online from the estimator's own state. An `O(Kn²)` state update per day, positive semi-definite **by construction**, missing values handled **natively**, no tuning, no refits. Only dependency: NumPy.
 
