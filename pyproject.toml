@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "squeeze-kernel"
-version = "3.1.0"
+version = "3.1.1"
 description = "Streaming, PSD-by-construction covariance estimator with Fisher-kernel weighting and adaptive shrinkage"
 readme = "README.md"
 license = "MIT"

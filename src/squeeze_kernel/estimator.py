@@ -153,6 +153,18 @@ class _BlendGradient:
     """
 
     _JITTER = 1e-12
+    _FLOOR = 1e-8   # spectral floor of the scored blend
+    _CERT = 10.0    # certify lambda_min >= _CERT * _FLOOR before skipping the floor
+
+    @staticmethod
+    def _solve(sig: np.ndarray, r: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """(sig^-1 r, sig^-1) from one Cholesky factorisation."""
+        if _cho_factor is not None:
+            cf = _cho_factor(sig, lower=True, check_finite=False)
+            return (_cho_solve(cf, r, check_finite=False),
+                    _cho_solve(cf, np.eye(sig.shape[0]), check_finite=False))
+        sinv = np.linalg.inv(sig)
+        return sinv @ r, sinv
 
     def __init__(self, half_lives: np.ndarray, prior: np.ndarray,
                  split: bool = False, n_experts: int = 3) -> None:
@@ -224,23 +236,31 @@ class _BlendGradient:
             for k in range(K):
                 sig += self.prev_w[k] * self.prev_sig[k][np.ix_(idx, idx)]
             sig = 0.5 * (sig + sig.T)
-        # Floor the spectrum before factorising, exactly as the research
-        # engine's scoring path does: a near-singular early blend would
-        # otherwise hand the running scale one enormous gradient and
-        # silence the mixer for years.
-        min_eig = float(np.linalg.eigvalsh(sig).min())
-        if min_eig < 1e-8:
-            sig = sig + np.eye(idx.size) * (1e-8 - min_eig)
+        # The spectrum is floored at _FLOOR before factorising, exactly as
+        # the research engine's scoring path does: a near-singular early
+        # blend would otherwise hand the running scale one enormous
+        # gradient and silence the mixer for years.  The floor acts only
+        # when lambda_min < _FLOOR, so factorise first and certify: the
+        # inverse gives lambda_min >= 1/||sig^-1||_F, and a certified day
+        # is bit-identical to the floored path (no floor, same factor).
+        # Uncertified or failed days take the eigenvalue floor as before.
+        sol: tuple[np.ndarray, np.ndarray] | None = None
         try:
-            if _cho_factor is not None:
-                cf = _cho_factor(sig, lower=True, check_finite=False)
-                u = _cho_solve(cf, r_t[idx], check_finite=False)
-                sinv = _cho_solve(cf, np.eye(idx.size), check_finite=False)
-            else:
-                sinv = np.linalg.inv(sig)
-                u = sinv @ r_t[idx]
+            sol = self._solve(sig, r_t[idx])
+            fro = float(np.linalg.norm(sol[1]))
+            if not (np.isfinite(fro) and fro * self._CERT * self._FLOOR <= 1.0):
+                sol = None
         except (np.linalg.LinAlgError, ValueError):
-            return None
+            sol = None
+        if sol is None:
+            min_eig = float(np.linalg.eigvalsh(sig).min())
+            if min_eig < self._FLOOR:
+                sig = sig + np.eye(idx.size) * (self._FLOOR - min_eig)
+            try:
+                sol = self._solve(sig, r_t[idx])
+            except (np.linalg.LinAlgError, ValueError):
+                return None
+        u, sinv = sol
         g = np.empty(K)
         self._gc = None
         if self.split and self.prev_comps is not None:

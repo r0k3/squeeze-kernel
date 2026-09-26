@@ -1,5 +1,29 @@
 # Changelog
 
+## 3.1.1 — 2026-09-26
+
+Performance only; every output is bit-identical to 3.1.0.
+
+- **The blend gradient skips its eigenvalue floor on certified days.**
+  The scored blend was floored at ``lambda_min >= 1e-8`` through a full
+  symmetric eigenvalue computation every day, although the floor acts
+  only in the first days of a panel.  The inverse the gradient needs
+  anyway certifies ``lambda_min >= 1/||Sigma^-1||_F``; a day certified
+  at ten times the floor is factorised once and is bit-identical to the
+  floored path, every other day takes the floor exactly as before.
+  Measured: the eigenvalue computation now runs on 3 of 7,840 days of
+  the S&P n = 100 panel (5 of 7,648 at n = 300); on panels whose returns
+  are small enough for the floor to bind (short-rate futures) it still
+  runs, as it must, and such a day costs one extra Cholesky factorisation
+  (the attempt that fails to certify).  Research engine and library stay
+  bit-identical.
+- New test ``tests/test_floor_certificate.py`` pins the exactness,
+  including a panel on which the floor binds every day.
+- New test ``tests/test_gram_representation.py`` pins the closed form of
+  the correlation flow: ``Q_k = S^{-1/2} M_k S^{-1/2}`` with ``M_k`` the
+  exponentially weighted Gram matrix of the clock-weighted returns
+  ``sqrt(w) * z`` (missing assets and late listings included).
+
 ## 3.1.0 — 2026-09-19
 
 The learned shrinkage split.  Same public surface, ``SqueezeKernel(lam)``;
