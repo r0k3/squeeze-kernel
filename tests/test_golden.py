@@ -12,7 +12,7 @@ import pytest
 
 from squeeze_kernel import SqueezeKernelEstimator
 
-from golden_scenarios import ESTIMATOR_KWARGS, PROMOTED_KWARGS, SPLIT_KWARGS, N, SCENARIOS
+from golden_scenarios import ESTIMATOR_KWARGS, PROMOTED_KWARGS, SPLIT_KWARGS, TYLER_KWARGS, N, SCENARIOS
 
 GOLDEN = Path(__file__).resolve().parent / "golden"
 
@@ -40,6 +40,23 @@ def test_promoted_golden_path(name):
     x = SCENARIOS[name]()
     t_mid = x.shape[0] // 2
     est = SqueezeKernelEstimator(N, **PROMOTED_KWARGS)
+    cov_mid = None
+    for t, r in enumerate(x):
+        est.update(r)
+        if t == t_mid:
+            cov_mid = est.get_cov()
+    np.testing.assert_allclose(cov_mid, ref["cov_mid"], rtol=1e-8, atol=1e-10)
+    np.testing.assert_allclose(est.get_cov(), ref["cov_final"], rtol=1e-8, atol=1e-10)
+    np.testing.assert_allclose(est.get_corr(), ref["corr_final"], rtol=1e-8, atol=1e-10)
+
+
+@pytest.mark.parametrize("name", list(SCENARIOS))
+def test_tyler_golden_path(name):
+    """3.2 configuration (joint observation weight), pinned on every scenario."""
+    ref = np.load(GOLDEN / f"tyler_{name}.npz")
+    x = SCENARIOS[name]()
+    t_mid = x.shape[0] // 2
+    est = SqueezeKernelEstimator(N, **TYLER_KWARGS)
     cov_mid = None
     for t, r in enumerate(x):
         est.update(r)

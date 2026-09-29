@@ -1,6 +1,7 @@
 """Theorem 1 of the paper: the diagonal-congruence flow is a clock-weighted
-Gram matrix, Q_k = S^{-1/2} M_k S^{-1/2} with M_k <- lam_k M_k + u u',
-u = sqrt(w) o z, so corr(Q_k) = corr(M_k), missing assets included."""
+Gram matrix, Q_k = S^{-1/2} M_k S^{-1/2} with M_k <- lam_k M_k + omega u u',
+u = sqrt(w) o z and omega the day's observation weight (3.2: n/m; one when
+the gradient abstains), so corr(Q_k) = corr(M_k), missing assets included."""
 
 import numpy as np
 
@@ -24,7 +25,7 @@ def test_flow_is_clock_weighted_gram(rng):
         fin = np.isfinite(r)
         z = np.zeros_like(r)
         z[fin] = r[fin] / (est._vol_t[fin] + est.epsilon)
-        u = np.sqrt(w) * z
+        u = np.sqrt(w) * z * np.sqrt(est._last_omega)
         for k in range(lam.size):
             M[k] = lam[k] * M[k] + np.outer(u, u)
             S = est._S_asset[k]

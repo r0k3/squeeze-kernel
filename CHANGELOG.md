@@ -1,5 +1,36 @@
 # Changelog
 
+## 3.2.0 — 2026-09-28
+
+The joint observation weight.  Same public surface, ``SqueezeKernel(lam)``;
+every timescale's correlation state changes, so a minor version with a
+behaviour change (the 3.1 path is ``obs_weight=None`` on
+``SqueezeKernelEstimator``, bit-for-bit).
+
+- **Each day's correlation innovation is scaled by omega = n/m**, with
+  ``m = r' Sigma^-1 r`` the day's Mahalanobis distance under the
+  estimator's own forecast of the day before and ``n`` the number of
+  observed assets: the posterior mean of the inverse common trading-time
+  increment under the scale-invariant prior (Tyler's shape weight, the
+  ``nu -> 0`` limit of the Student-t score weight).  The day's norm then
+  enters the state once, through the clock as trading time, and its
+  direction through the outer product.  No new constant; ``m`` comes from
+  the solve the blend gradient already performs, so the cost is one dot
+  product a day.  On a day the gradient abstains the weight is one.
+- Measured (research record, squeeze_cov R0K-67): on twelve sealed
+  equity universes drawn after the design was fixed, scored once on
+  2022–2026, better than 3.1 on eleven, by 0.6 to 1.8 NLL per day at
+  n = 200 and 300, never significantly worse; S&P validation block
+  −0.3 / −0.5 / −1.0 per day at n = 100 / 200 / 300.  The diversified
+  futures held-out block is the trade-off, +0.5 per day: the weight
+  discounts the break days of 2020 and 2022 that carry that panel's new
+  structure.  Under the Student-t and the density-power scores the
+  picture is the same.
+- ``state()`` gains ``omega_t``, the day's weight.
+- Cross-engine golden ``tests/golden/v3_tyler.npz`` (the research engine
+  on the synthetic panel, the 3.2 and the 3.1 row; the library within
+  3e-13 per day) and ``tests/golden/tyler_*.npz`` on the five scenarios.
+
 ## 3.1.1 — 2026-09-26
 
 Performance only; every output is bit-identical to 3.1.0.

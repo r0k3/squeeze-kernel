@@ -121,6 +121,7 @@ class SqueezeKernel:
             vol_ladder=True,
             weights="eg_blend",
             split_learn=True,
+            obs_weight="tyler",
             epsilon=c.epsilon,
         )
 
@@ -177,6 +178,7 @@ class SqueezeKernel:
             "rung_nu": nu,
             "detector_tilt": 0.0 if det is None else det.tilt,
             "split": det.v.copy() if isinstance(det, _BlendGradient) and det.split else None,
+            "omega_t": est._last_omega,
         }
 
     # ── v1 escape hatch ──────────────────────────────────────────────────

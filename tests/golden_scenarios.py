@@ -42,6 +42,11 @@ PROMOTED_KWARGS = dict(
 # weighted by the blend gradient from the intensity rule's prior).
 SPLIT_KWARGS = dict(PROMOTED_KWARGS, split_learn=True)
 
+# The 3.2 promoted configuration: 3.1 with the joint observation weight
+# omega = n/m on each day's correlation innovation (what ``SqueezeKernel``
+# builds from 3.2 on).
+TYLER_KWARGS = dict(SPLIT_KWARGS, obs_weight="tyler")
+
 
 def _block_returns(rng, t, within=0.6, cross=0.0):
     """Two 20-asset blocks with the given within/cross correlations."""

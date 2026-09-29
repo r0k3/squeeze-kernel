@@ -193,10 +193,17 @@ class _BlendGradient:
         self.prev_vol: np.ndarray | None = None
         self.prev_v: np.ndarray | None = None
         self._gc: np.ndarray | None = None
+        # The day's Mahalanobis distance under the forecast, m = r' Sigma^-1 r
+        # on the observed subvector, and that subvector's size: read by the
+        # 3.2 observation weight; NaN on a day the gradient abstains.
+        self.m_last = float("nan")
+        self.n_last = 0
 
     def score(self, r_t: np.ndarray, finite: np.ndarray) -> np.ndarray | None:
         """Gradient of the previous blend's log score at ``r_t`` (observed
         subvector), one entry per rung; ``None`` on a degenerate day."""
+        self.m_last = float("nan")
+        self.n_last = 0
         if self.prev_sig is None or self.prev_w is None:
             return None
         idx = np.flatnonzero(finite)
@@ -261,6 +268,8 @@ class _BlendGradient:
             except (np.linalg.LinAlgError, ValueError):
                 return None
         u, sinv = sol
+        self.m_last = float(r_t[idx] @ u)
+        self.n_last = int(idx.size)
         g = np.empty(K)
         self._gc = None
         if self.split and self.prev_comps is not None:
@@ -442,6 +451,7 @@ class SqueezeKernelEstimator:
         vol_ladder: bool = False,
         weights: str = "cusum",
         split_learn: bool = False,
+        obs_weight: str | None = None,
     ):
         self.n_assets = n_assets
         if weights not in ("cusum", "eg_blend"):
@@ -450,6 +460,21 @@ class SqueezeKernelEstimator:
         if split_learn and weights != "eg_blend":
             raise ValueError("split_learn requires weights='eg_blend'.")
         self.split_learn = bool(split_learn)
+        # 3.2: the joint observation weight.  "tyler" scales each day's
+        # correlation innovation by omega = n/m, m = r' Sigma^-1 r the
+        # day's Mahalanobis distance under the estimator's own forecast of
+        # the day before (n the observed count): the posterior mean of the
+        # inverse common trading-time increment under the scale-invariant
+        # prior, Tyler's shape weight, the nu -> 0 limit of the Student-t
+        # score weight.  The day's norm then enters the state once, through
+        # the clock, and its direction through the outer product.  None
+        # keeps the 3.1 path bit-for-bit.
+        if obs_weight not in (None, "tyler"):
+            raise ValueError("obs_weight must be None or 'tyler'.")
+        if obs_weight is not None and (weights != "eg_blend" or clock != "asset"):
+            raise ValueError("obs_weight='tyler' requires weights='eg_blend' and clock='asset'.")
+        self.obs_weight = obs_weight
+        self._last_omega = 1.0
         self.vol_ladder = bool(vol_ladder)
         self.lambda_vol = lambda_vol
         self.lambda_corr = lambda_corr
@@ -748,6 +773,16 @@ class SqueezeKernelEstimator:
                     finite,
                     self._kap_lam * kap_a + (1.0 - self._kap_lam) * a_act,
                     kap_a)
+            # 3.2 observation weight: sqrt(omega) on the innovation, omega =
+            # n/m from the gradient's own solve of the forecast at r_t; one
+            # on a day the gradient abstained.
+            sq_omega = 1.0
+            if w_vec is not None and self.obs_weight == "tyler":
+                assert isinstance(detector, _BlendGradient)
+                m_day = detector.m_last
+                if np.isfinite(m_day) and m_day > 1e-12:
+                    sq_omega = float(np.sqrt(detector.n_last / m_day))
+            self._last_omega = sq_omega * sq_omega
             s_eff = 0.0
             for k in range(corr_lam.size):
                 S_list[k] = corr_lam[k] * S_list[k] + w_t
@@ -759,6 +794,8 @@ class SqueezeKernelEstimator:
                     eta_v = w_vec / S_a[k]
                     o = np.sqrt(1.0 - eta_v)
                     u = np.sqrt(eta_v) * z_t
+                    if sq_omega != 1.0:
+                        u = u * sq_omega
                     np.multiply.outer(o, o, out=self._scratch_had)
                     Q_list[k] *= self._scratch_had
                     np.multiply.outer(u, u, out=self._scratch_had)
