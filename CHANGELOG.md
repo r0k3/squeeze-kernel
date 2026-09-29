@@ -1,6 +1,6 @@
 # Changelog
 
-## 3.2.0 — 2026-09-28
+## 3.2.0 — 2026-09-29
 
 The joint observation weight.  Same public surface, ``SqueezeKernel(lam)``;
 every timescale's correlation state changes, so a minor version with a
