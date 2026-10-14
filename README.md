@@ -5,8 +5,9 @@
 [![Python](https://img.shields.io/pypi/pyversions/squeeze-kernel.svg)](https://pypi.org/project/squeeze-kernel/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![DOI](https://zenodo.org/badge/1188987927.svg)](https://doi.org/10.5281/zenodo.19170801)
+[![Paper](https://img.shields.io/badge/paper-SSRN%206455918-b31b1b.svg)](https://ssrn.com/abstract=6455918)
 
-A **streaming covariance estimator for panels of financial returns** whose entire public surface is **one number** — the decay `lam` of the anchor correlation timescale. Every other quantity is derived from it, fixed by a structural argument, or computed online from the estimator's own state. An `O(Kn²)` state update per day, positive semi-definite **by construction**, missing values handled **natively**, no tuning, no refits. Only dependency: NumPy.
+**A streaming covariance estimator for panels of financial returns that beats every fitted baseline out of sample, costs half a millisecond to ten milliseconds a day, and has one parameter.**
 
 ```python
 from squeeze_kernel import SqueezeKernel
@@ -14,28 +15,88 @@ from squeeze_kernel import SqueezeKernel
 sk = SqueezeKernel(lam=0.996)        # the entire public surface
 for r_t in returns:                  # NaN marks missing assets
     sk.update(r_t)
-cov = sk.covariance()
+cov = sk.covariance()                # positive semi-definite by construction, every day
 ```
 
-Reference: Kende (2026), *The Squeeze Kernel Covariance Estimator* — [SSRN abstract 6455918](https://ssrn.com/abstract=6455918). The 3.x estimator is described in the paper's September 2026 revision, *The Squeeze Kernel Covariance Estimator: A Diagonal-Congruence Flow in Per-Asset Trading Time*.
+- **State of the art, measured.** On thirty years of S&P 500 constituents it leads ten baselines fitted to the data (CM-IEWMA, DCC, DCC-NL, nonlinear shrinkage, Ledoit–Wolf, OAS, RMT denoising, Gerber, IEWMA, EWMA) at every universe size from 50 to 300, every Diebold–Mariano *p* below 10⁻⁷, and it is the **sole member of the 90% model confidence set at every size**. With its configuration frozen on data to 2021 it stays first on 2022–2026, on **twenty-four sealed small- and mid-cap universes it had never seen**, on a 121-instrument futures panel across eight asset classes, and on the public Fama–French 49 panel on the competing authors' own metric.
+- **Fast, with nothing that can fail.** One `O(Kn²)` state update, one Cholesky factorisation of the blend and `K` positive-definiteness checks a day. No rolling window, no likelihood refit, no daily solver. **0.54 ms a day at n = 50, 10.1 ms at n = 300.** The closest competitor on accuracy, CM-IEWMA as released by its authors, takes 18 to 51 times as long and spends most of it in a convex programme that is infeasible on about one scored day in five at n = 300.
+- **One number, no tuning.** Everything else is derived from `lam`, fixed by a structural argument, or computed online from the estimator's own state. Listings, delistings and halts enter as `NaN`. Only dependency: NumPy.
+
+Paper: Kende (2026), *The Squeeze Kernel Covariance Estimator*, [SSRN 6455918](https://ssrn.com/abstract=6455918). Every number on this page is taken from the tables of the paper's September 2026 revision, *A Diagonal-Congruence Flow in Per-Asset Trading Time*, which describes the 3.x estimator and carries the protocol, the proofs and the full ablation ledger.
+
+[Benchmarks](#benchmarks) · [See the difference](#see-the-difference) · [Installation](#installation) · [Quickstart](#quickstart) · [How it works](#how-it-works) · [Limits](#where-it-stops) · [Citation](#citation)
 
 ## Why
 
-Markets do not keep calendar time. Following Mandelbrot, the estimator treats a panel as a collection of partially coupled markets, **each advancing on its own activity-driven clock** — and reads those clocks from the panel's own correlation structure, so a hot cluster (say precious metals and FX) advances its correlation state while an idle one (agriculture) does not, without anyone identifying a cluster. On those clocks it runs a single recursion that:
+Markets do not keep calendar time. Following Mandelbrot, the estimator treats a panel as a collection of partially coupled markets, **each advancing on its own activity-driven clock**, and reads those clocks from the panel's own correlation structure: a hot cluster (say precious metals and FX) advances its correlation state while an idle one (agriculture) does not, and nobody has to identify the cluster. On those clocks it runs a single recursion that **learns in market time and forgets in calendar time**, shrinks itself from two online statistics, and re-weights its three timescales by the gradient of its own log score. Nothing is fitted but `lam`.
 
-- **is PSD at every step, structurally** — the correlation state evolves by a diagonal-congruence flow (a congruence plus a rank-one term); no eigenvalue clipping, no nearest-PSD repair, and no factorisation anywhere in the state update. (The adaptive mixture is the one exception: it reads the gradient of the blend's own log score, which costs one Cholesky factorisation of the blend and a positive-definiteness check of each timescale's block per day. Switch it off on `SqueezeKernelEstimator` and the estimator is pure `O(Kn²)`.)
-- **learns in market time and forgets in calendar time** — observations enter with a saturating, self-studentising weight (no day counts more than one unit of trading time); memory decays at fixed per-day rates on a geometric ladder of three timescales `(lam⁴, lam, lam^¼)`. Pairs accrue covariance at the geometric mean of their two clock increments, which is the most positive semi-definiteness allows and exactly the Cauchy–Schwarz bound on how far two assets' clocks can overlap. In closed form, each timescale's correlation is that of an exponentially weighted Gram matrix of the clock-weighted returns `√w·z`: day `s` enters the pair `(i, j)` with weight `√(w_i,s·w_j,s)` (market time) and is discounted by `lam_k^(t−s)` (calendar time). That makes it the natural-gradient step of the Gaussian log score, taken as a chord in calendar time on clock-weighted data; the geodesic along the same gradient would be an unbounded time change;
-- **uses each day's magnitude once** — the day's Mahalanobis norm under the estimator's own forecast, `m = r'Σ⁻¹r`, sets the clock and is then removed from the observation: the innovation carries the weight `ω = n/m`, the posterior mean of the inverse trading-time increment under a scale-free prior (Tyler's weight; the Student-t score-driven weight is the same posterior mean under an inverse-gamma prior). A day's direction moves the state; its size only says how much trading time it carried. One dot product from the factorisation the mixture already performs, no constant;
-- **regularises itself** — each timescale's shrinkage intensity is computed from two online statistics, the concentration `n/ν` (dimension per unit trading time) and the de-noised fraction of correlation dispersion the target explains; the target is the Hadamard square of the running correlation, which is exactly the correlation matrix of the *squared* returns (cluster-respecting, PSD by the Schur product theorem, and sign-blind by construction — the signs are carried by the unshrunk term). The intensity rule is the *prior* of a learned split: each timescale's shrunk correlation is a pool of its raw correlation, its equicorrelation level and its Hadamard square, whose weights are pulled toward the rule's `(1−α, α(1−α), α²)` by a fixed share and corrected online by the blend gradient;
-- **adapts its memory to regime breaks, in both stages** — the timescale mix moves by an exponentiated-gradient step on the *blend's* own log score (not on any single timescale's, which would select rather than blend): each weight follows the Fisher–Rao inner product of its timescale with the day's natural gradient, at a temperature calibrated so that uninformative evidence leaves the mix within a factor e of its prior; the marginal variance is tracked on its own three-rung ladder, two octaves below the correlation ladder, and pooled panel-wide by the same rule on saturated evidence, so one spike day cannot hand a stale rung weeks of weight. Nothing in either mixture is fitted: the ladders are derived from `lam`, the evidence memory is the fastest rung's, and the temperature is the null's;
-- **ingests missing values natively** — listings, delistings, halts enter as `NaN`;
-- **is cheap, with no solver** — `O(Kn²)` state work plus `K + 1` Cholesky factorisations a day, no iterative optimisation anywhere; a thirty-year daily pass at n = 300 takes about two minutes single-threaded (the mixture's factorisation also certifies the spectral floor of the scored blend inactive on almost every day, and supplies the observation weight for one dot product). CM-IEWMA as released by its authors takes 11–41 times as long on the same panels, most of it a daily convex programme that is infeasible on up to 19% of days at n = 300; DCC and DCC-NL are cheaper still.
+Against the field it is scored on:
 
-**Evidence.** On thirty years of S&P 500 constituents against a ten-method field, every baseline fitted on a tuning block (EWMA, DCC, DCC-NL, Ledoit–Wolf, OAS, nonlinear shrinkage, RMT filtering, Gerber, IEWMA, CM-IEWMA), it leads at every universe size from 50 to 300 and is the **sole member of the 90% model confidence set at every size**. Frozen on data to 2021, it leads the best baseline on 2022–2026 by 1.7, 3.7, 11.1 and 19.2 NLL per day at n = 50, 100, 200 and 300. On twenty-four pre-registered universes of small and mid caps sealed before any scoring (two draws of twelve) it is first on every one against a field fitted to each universe, by 13 to 18 NLL per day at n = 300; the second draw was sealed for the observation weight, which improved the estimator on eleven of the twelve, by 0.6 to 1.8 NLL per day at n ≥ 200. Carried **zero-shot** to a diversified panel of 121 futures across eight asset classes it beats the five baselines that run there, *calibrated on that panel's own history*, by 11.3 to 121 NLL per day out-of-time (the weight costs 0.5 per day on that block, its one trade-off); on the public FF49 industry panel of Johansson et al. it has the lowest regret on their own metric. The ranking holds under the Student-t and density-power scores.
+| | Squeeze Kernel | CM-IEWMA (as released) | DCC, DCC-NL | Window shrinkage (LW, OAS, NLS, RMT) |
+|---|---|---|---|---|
+| Clock | per-asset market clocks | calendar | calendar | calendar window |
+| Daily work | `O(Kn²)` update, one Cholesky, no solver | daily convex programme | GARCH recursion | re-estimate on the window |
+| Tuned in the paper | nothing: `lam = 0.996`, fixed on data to 2021 | fitted on a tuning block, re-fitted to each sealed universe | fitted on a tuning block, re-fitted to each sealed universe | fitted on a tuning block, re-fitted to each sealed universe |
+| Milliseconds a day, n = 50 → 300 | **0.54 → 10.1** | 18.8 → 182.2 | 0.05 → 0.83, 0.09 → 1.83 | not timed |
+| Days the solver fails, n = 300 | no solver | 1,196 of 6,439 scored | — | — |
+
+## Benchmarks
+
+The score is the one-step-ahead Gaussian negative log-likelihood (NLL) of the next day's returns under each estimator's forecast, averaged per day; lower is better. Every baseline is fitted on a tuning block before it is scored. The ranking holds under the Student-t and density-power scores as well.
+
+### Thirty years of S&P 500 constituents, 1995–2026
+
+Each baseline's row is its **excess NLL per day over the Squeeze Kernel**. Every Diebold–Mariano *p* is below 10⁻⁷. The Squeeze Kernel is the sole member of the 90% model confidence set at every size.
+
+| | n = 50 | n = 100 | n = 200 | n = 300 |
+|---|---:|---:|---:|---:|
+| **Squeeze Kernel, average NLL** | **−371.28** | **−753.21** | **−1539.32** | **−2334.88** |
+| CM-IEWMA | +1.63 | +4.58 | +12.45 | +20.70 |
+| DCC | +2.04 | +5.31 | +13.49 | +25.38 |
+| DCC-NL | +2.21 | +5.53 | +13.90 | +24.67 |
+| RMT denoising | +6.60 | +14.72 | +32.39 | +58.94 |
+| Gerber (PSD) | +7.00 | +15.61 | +38.82 | +62.98 |
+| Nonlinear shrinkage | +6.29 | +16.10 | +42.84 | +73.22 |
+| IEWMA | +3.98 | +16.56 | +79.79 | +224.73 |
+| EWMA | +7.10 | +19.92 | +58.71 | +80.81 |
+| Ledoit–Wolf | +6.75 | +20.44 | +60.42 | +98.94 |
+| OAS | +8.44 | +23.96 | +66.04 | +106.56 |
+
+### Out of sample, configuration frozen on data to 2021
+
+| | n = 50 | n = 100 | n = 200 | n = 300 |
+|---|---:|---:|---:|---:|
+| **S&P constituents, 2022–2026**: lead over the best baseline (CM-IEWMA at every size), NLL per day | 1.72 | 3.72 | 11.12 | 19.16 |
+| **Twenty-four sealed small- and mid-cap universes**, six per size, 2022–2026, field fitted to each universe: universes on which it is first | 6 of 6 | 6 of 6 | 6 of 6 | 6 of 6 |
+| lead over the best baseline, range | 0.1–1.2 | 2.7–4.0 | 8.6–10.9 | 13.2–17.5 |
+| sole member of the 90% model confidence set | 1 of 6 | 6 of 6 | 6 of 6 | 6 of 6 |
+
+Carried **zero-shot** to other panels, same `lam`:
+
+| Panel | Result |
+|---|---|
+| **121 futures**, eight asset classes, held out from mid-2018, baselines calibrated on that panel's own history | first; leads DCC-NL by 11.3 NLL per day (*p* = 10⁻⁸), IEWMA by 14.4, DCC by 18.2, EWMA by 36.0, Ledoit–Wolf by 121.4 |
+| **Fama–French 49 industries**, scored with the CM-IEWMA authors' own regret metric (lower is better) | **16.35**, against CM-IEWMA 16.96, IEWMA 18.20, EWMA 19.39 |
+
+### Cost
+
+Milliseconds per forecast day, single-threaded, over the full thirty-year pass:
+
+| | n = 50 | n = 100 | n = 200 | n = 300 |
+|---|---:|---:|---:|---:|
+| **Squeeze Kernel** | **0.54** | **0.91** | **2.80** | **10.1** |
+| CM-IEWMA as released | 18.8 | 46.4 | 106.8 | 182.2 |
+| of which the daily convex programme | 16.1 | 39.9 | 85.4 | 142.1 |
+| days on which the programme fails | 0 | 50 | 294 | 1,196 |
+| peak memory, GB | 2.0 | 6.4 | 22.4 | 45.3 |
+| DCC | 0.05 | 0.11 | 0.28 | 0.83 |
+| DCC-NL | 0.09 | 0.25 | 0.92 | 1.83 |
+
+Two honest footnotes. The released CM-IEWMA code overstates what the method has to cost: its linear algebra alone, with the programme treated as free, would run in 60% to 121% of the Squeeze Kernel's time. The cost is the solver, and so is the fragility. And DCC and DCC-NL are cheaper than both; they are also 13 to 25 NLL per day behind at n = 200 and 300.
 
 ## See the difference
 
-A passive strategy any allocator would recognize: long-only minimum-variance over 300 liquid US stocks, scaled to a 15% volatility target, rebalanced monthly, 5 bps costs. Two runs on identical data; the only difference is the covariance matrix. The Squeeze Kernel arm runs `SqueezeKernel(lam=0.996)` — **nothing tuned on this panel**.
+A passive strategy any allocator would recognise: long-only minimum-variance over 300 liquid US stocks, scaled to a 15% volatility target, rebalanced monthly, 5 bps costs. Two runs on identical data; the only difference is the covariance matrix. The Squeeze Kernel arm runs `SqueezeKernel(lam=0.996)`, **nothing tuned on this panel**.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/r0k3/squeeze-kernel/main/examples/figures/vol_targeted_portfolio_dark.png">
@@ -44,14 +105,14 @@ A passive strategy any allocator would recognize: long-only minimum-variance ove
 
 | Method | CAGR | Vol | Sharpe | MaxDD | Calmar | Vol-target RMSE |
 |---|---|---|---|---|---|---|
-| **Squeeze Kernel (default)** | **12.5%** | **13.6%** | **0.92** | **-34.5%** | **0.36** | **7.05%** |
+| **Squeeze Kernel (default)** | **12.6%** | **13.6%** | **0.92** | **-34.3%** | **0.37** | **7.05%** |
 | Ledoit-Wolf (252d) | 11.7% | 14.6% | 0.80 | -38.7% | 0.30 | 7.51% |
 
 Reproduce from the repo alone (the 300-stock panel ships as a parquet; survivorship and provenance are documented in the script):
 
 ```bash
 pip install squeeze-kernel pandas pyarrow scikit-learn matplotlib
-python examples/vol_targeted_portfolio.py    # ~2 minutes
+python examples/vol_targeted_portfolio.py    # ~1 minute for the 26-year stream
 ```
 
 ## Installation
@@ -83,7 +144,31 @@ Missing values: pass `NaN` (or `mask=` on `update`). Newly listed, delisted or h
 
 Units: pass returns in decimal units (`0.01` = 1%). The numerical floors are absolute (`ε = 1e-8` in squared-return units), so percent-unit returns give a different path. A panel whose first day carries many exact-zero returns starts with a transient that the slow timescale remembers; start a day later.
 
-## What derives from `lam`
+## How it works
+
+```mermaid
+flowchart LR
+    R["return r_t<br/>(NaN = missing)"] --> V["variance ladder<br/>3 rungs per asset,<br/>pooled panel-wide"]
+    V --> Z["standardised<br/>surprise z_t"]
+    Z --> W["per-asset clocks<br/>from the correlation<br/>neighbourhood"]
+    W --> Q["diagonal-congruence update<br/>of 3 correlation timescales,<br/>outer product scaled by n/m"]
+    Q --> S["per-timescale shrinkage<br/>raw / equicorrelation /<br/>Hadamard square"]
+    S --> B["blend across timescales<br/>by the gradient of<br/>its own log score"]
+    B --> O["Σ_t"]
+```
+
+One daily update, in words:
+
+1. **Volatility with self-selected memory.** Each asset's variance runs on a three-rung ladder of half-lives (`h/16, h/4, h`), pooled panel-wide by weights that move on saturated evidence, so one spike day cannot hand a stale rung weeks of weight. The day's return is standardised by it.
+2. **Per-asset clocks.** Each asset reads its activity as the neighbourhood mean of squared surprises, weighted by the Hadamard square of yesterday's correlation (under conditional Gaussianity that square *is* the correlation of squared returns, so the neighbourhood is the asset's own cluster, no labels needed). A saturating kernel maps activity to a clock increment in `[0, 1)`: an unbounded shock is squeezed into at most one unit of trading time.
+3. **Magnitude once, direction once.** The day's Mahalanobis norm under the estimator's own forecast, `m = r'Σ⁻¹r`, sets the clocks; the innovation then enters with weight `n/m`, so a day's direction moves the state and its size only says how much trading time it carried. Score-driven and robust estimators down-weight such a day as contamination; this one reads it as time.
+4. **Diagonal-congruence flow on three timescales.** Each correlation state advances by a congruence plus a rank-one term on the clocks, with decays `(lam⁴, lam, lam^¼)`. In closed form it is an exponentially weighted Gram matrix of clock-weighted returns: pairs accrue at the geometric mean of their two clock increments, which is exactly the Cauchy–Schwarz bound on how far two clocks can overlap and the most positive semi-definiteness allows. No eigenvalue clipping, no nearest-PSD repair, any missing-data pattern.
+5. **Self-tuning, label-free shrinkage.** Each timescale's shrunk correlation is a pool of its raw correlation, its equicorrelation level and its Hadamard square. The Hadamard square suppresses cross-cluster noise quadratically (0.10 → 0.01) while keeping intra-cluster blocks (0.60 → 0.36). The pool's prior weights come from a closed-form intensity rule read off two online statistics; the blend gradient corrects them.
+6. **Blend by the gradient of the blend's own score.** The timescale weights follow an exponentiated-gradient step on the blend's log score (not any single timescale's, which would select rather than blend), at a temperature calibrated so that uninformative evidence leaves the mix within a factor *e* of its prior. Nothing in either mixture is fitted.
+
+The paper gives the derivations (natural-gradient and Gram-matrix forms of the flow, the Fisher–Rao form of the mixture), the guarantees (PSD at every step, a conditioning floor, strict positive definiteness whenever a positively weighted timescale has its intensity strictly inside (0, 1), exact reductions to the published special cases) and the full evaluation.
+
+### What derives from `lam`
 
 | quantity | value |
 |---|---|
@@ -99,9 +184,15 @@ Units: pass returns in decimal units (`0.01` = 1%). The numerical floors are abs
 
 `from squeeze_kernel import CONSTANTS` exposes the structural constants for research. The published v1 estimator (all its knobs) remains available as `SqueezeKernelEstimator` / `SqueezeKernel.v1(...)`; every mechanism since 2.0 is also an estimator-level switch for ablation. See [MIGRATION.md](MIGRATION.md).
 
-## How it works
+## Where it stops
 
-One daily update: variance on a three-rung ladder per asset, pooled by panel-wide self-adapting weights → standardised surprise → per-asset clock increments from the Schur-square-weighted neighbourhood mean of squared surprises → diagonal-congruence update of each timescale's correlation state on those clocks, the day's outer product scaled by `n/m` → per-timescale shrinkage as a learned pool of the raw correlation, its equicorrelation level and its Hadamard square, with the self-tuning intensity rule as the prior and the blend gradient as the correction → blend across timescales, moved by the gradient of the blend's own log score → covariance. The paper gives the derivations (the natural-gradient and Gram-matrix forms of the flow, the Fisher–Rao form of the mixture), the guarantees (PSD, conditioning floor, exact reductions to the published special cases), and the full evaluation.
+The paper keeps an ablation ledger, and the entries that did not go its way are on the record.
+
+- **Per-asset clocks pay on diversified panels, less reliably on equities.** Against a single global clock they gain 0.66 NLL per day on the futures panel. On S&P universes the result is mixed: +0.02 at n = 50, −0.23 at n = 100 (*p* < 10⁻⁶), +0.21 at n = 300. Equities share one market factor, so their clocks run nearly in step and there is little to resolve.
+- **The observation weight is a trade-off on one block.** It improved eleven of twelve sealed equity universes, by 0.6 to 1.8 NLL per day at n ≥ 200, and costs 0.5 per day on the futures panel.
+- **Sign-blind where fully shrunk.** The shrinkage target is the Hadamard square of the running correlation, which has no negative entries; signs live in the unshrunk term. On the S&P panel at n = 300 the fast timescale sits at full intensity throughout and emits no negative correlation on any day. On the futures panel, where a third of raw correlations are negative, a negative pair keeps its sign through the slower timescales on ordinary days, but on break days the estimator gets fewer than a third of the realised negative correlations right.
+- **Own-book VaR.** Score the 1% VaR of a minimum-variance book that was optimised against the same forecast and every method under-covers, this one included; the paper discloses the under-coverage and traces it to selecting the book on the forecast.
+- **The FF49 margin is a lead, not a rout.** 16.35 against 16.96 on the CM-IEWMA authors' own metric.
 
 ## Development
 
@@ -117,10 +208,10 @@ uv build                       # build sdist + wheel
 
 ```bibtex
 @article{kende2026squeeze,
-  title  = {The Squeeze Kernel Covariance Estimator: Dual-Timescale Tracking with Adaptive Shrinkage},
+  title  = {The Squeeze Kernel Covariance Estimator},
   author = {Kende, Robert},
   year   = {2026},
-  note   = {Available at SSRN: \url{https://ssrn.com/abstract=6455918}}
+  note   = {Working paper. Available at SSRN: \url{https://ssrn.com/abstract=6455918}}
 }
 ```
 
