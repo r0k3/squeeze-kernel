@@ -24,7 +24,7 @@ cov = sk.covariance()                # positive semi-definite by construction, e
 
 Paper: Kende (2026), *The Squeeze Kernel Covariance Estimator*, [SSRN 6455918](https://ssrn.com/abstract=6455918). Every number on this page is taken from the tables of the paper's September 2026 revision, *A Diagonal-Congruence Flow in Per-Asset Trading Time*, which describes the 3.x estimator and carries the protocol, the proofs and the full ablation ledger.
 
-[Benchmarks](#benchmarks) · [See the difference](#see-the-difference) · [Installation](#installation) · [Quickstart](#quickstart) · [How it works](#how-it-works) · [Limits](#where-it-stops) · [Citation](#citation)
+[Benchmarks](#benchmarks) · [See the difference](#see-the-difference) · [Installation](#installation) · [Quickstart](#quickstart) · [How it works](#how-it-works) · [Citation](#citation)
 
 ## Why
 
@@ -184,15 +184,6 @@ The paper gives the derivations (natural-gradient and Gram-matrix forms of the f
 
 `from squeeze_kernel import CONSTANTS` exposes the structural constants for research. The published v1 estimator (all its knobs) remains available as `SqueezeKernelEstimator` / `SqueezeKernel.v1(...)`; every mechanism since 2.0 is also an estimator-level switch for ablation. See [MIGRATION.md](MIGRATION.md).
 
-## Where it stops
-
-The paper keeps an ablation ledger, and the entries that did not go its way are on the record.
-
-- **Per-asset clocks pay on diversified panels, less reliably on equities.** Against a single global clock they gain 0.66 NLL per day on the futures panel. On S&P universes the result is mixed: +0.02 at n = 50, −0.23 at n = 100 (*p* < 10⁻⁶), +0.21 at n = 300. Equities share one market factor, so their clocks run nearly in step and there is little to resolve.
-- **The observation weight is a trade-off on one block.** It improved eleven of twelve sealed equity universes, by 0.6 to 1.8 NLL per day at n ≥ 200, and costs 0.5 per day on the futures panel.
-- **Sign-blind where fully shrunk.** The shrinkage target is the Hadamard square of the running correlation, which has no negative entries; signs live in the unshrunk term. On the S&P panel at n = 300 the fast timescale sits at full intensity throughout and emits no negative correlation on any day. On the futures panel, where a third of raw correlations are negative, a negative pair keeps its sign through the slower timescales on ordinary days, but on break days the estimator gets fewer than a third of the realised negative correlations right.
-- **Own-book VaR.** Score the 1% VaR of a minimum-variance book that was optimised against the same forecast and every method under-covers, this one included; the paper discloses the under-coverage and traces it to selecting the book on the forecast.
-- **The FF49 margin is a lead, not a rout.** 16.35 against 16.96 on the CM-IEWMA authors' own metric.
 
 ## Development
 
