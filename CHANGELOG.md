@@ -1,6 +1,6 @@
 # Changelog
 
-## 4.0.0 — unreleased
+## 4.0.0 — 2026-10-17
 
 The library ships the estimator and nothing else.  Output is bit-identical
 to 3.2.0 on every day (checked on the 300-stock example panel, a 121-future
