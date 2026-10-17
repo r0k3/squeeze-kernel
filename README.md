@@ -182,8 +182,6 @@ The paper gives the derivations (natural-gradient and Gram-matrix forms of the f
 | structural constants | K=3, b=4, θ=½, κ-scale ⅓, Schur power 2, intensity exponent 2 — each bracketed by ablation in the paper |
 | fitted constants | `lam` itself (0.996, chosen on data to 2021); nothing else is fitted |
 
-`from squeeze_kernel import CONSTANTS` exposes the structural constants for research. The published v1 estimator (all its knobs) remains available as `SqueezeKernelEstimator` / `SqueezeKernel.v1(...)`; every mechanism since 2.0 is also an estimator-level switch for ablation. See [MIGRATION.md](MIGRATION.md).
-
 
 ## Development
 

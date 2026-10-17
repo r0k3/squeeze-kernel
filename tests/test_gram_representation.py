@@ -1,6 +1,6 @@
 """Theorem 1 of the paper: the diagonal-congruence flow is a clock-weighted
 Gram matrix, Q_k = S^{-1/2} M_k S^{-1/2} with M_k <- lam_k M_k + omega u u',
-u = sqrt(w) o z and omega the day's observation weight (3.2: n/m; one when
+u = sqrt(w) o z and omega the day's observation weight (n/m; one when
 the gradient abstains), so corr(Q_k) = corr(M_k), missing assets included."""
 
 import numpy as np

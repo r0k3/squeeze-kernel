@@ -2,9 +2,9 @@
 Squeeze Kernel Covariance Estimator
 ====================================
 
-Streaming, PSD-by-construction covariance estimator. The 2.0 API is one
-number; everything else derives from that decay, is a frozen
-structural constant, or is self-tuning state — including per-asset
+Streaming, PSD-by-construction covariance estimator whose public surface
+is one number: everything else derives from that decay, is a structural
+constant of the method, or is state computed online -- including per-asset
 market clocks read from the correlation structure itself.
 
 Quick start::
@@ -20,23 +20,11 @@ Quick start::
 
     cov = sk.covariance()
     corr = sk.correlation()
-
-The published v1 estimator (all legacy knobs) remains available as
-``SqueezeKernelEstimator`` or ``SqueezeKernel.v1(...)``; see MIGRATION.md.
 """
 
-from squeeze_kernel.core import CONSTANTS, SqueezeKernel, StructuralConstants
-from squeeze_kernel.estimator import SqueezeKernelEstimator
-from squeeze_kernel.kernels import kernel_fisher
+from squeeze_kernel.core import SqueezeKernel
 from squeeze_kernel.batch import estimate_squeeze_cov
 
-__all__ = [
-    "SqueezeKernel",
-    "StructuralConstants",
-    "CONSTANTS",
-    "SqueezeKernelEstimator",
-    "estimate_squeeze_cov",
-    "kernel_fisher",
-]
+__all__ = ["SqueezeKernel", "estimate_squeeze_cov"]
 
-__version__ = "3.2.0"
+__version__ = "4.0.0"

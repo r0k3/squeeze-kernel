@@ -2,50 +2,15 @@
 
 Each scenario returns a (T, n) float array (NaN = missing) built from a
 seeded generator, so the inputs are reproducible from source. The golden
-outputs in tests/golden/*.npz pin the exact covariance path of the
-combined cluster + scale-free estimator (the papers' headline
-configuration: adaptive-blend ladder + cluster target, detector
-integral) as of v0.6.0.
+outputs in tests/golden/<scenario>.npz pin the estimator's covariance at
+the middle and the end of each path and its final correlation.
 """
 
 import numpy as np
 
 N = 40
-LADDER = [43.0, 173.0, 693.0]
-THETA = 0.25
-
-ESTIMATOR_KWARGS = dict(
-    corr_half_lives=LADDER,
-    corr_theta=THETA,
-    shrinkage_target="cluster",
-)
-
-# The 3.0 promoted configuration (what ``SqueezeKernel(lam)`` builds): the
-# self-adapting volatility ladder and the blend-gradient mixture.  Pinned
-# separately so the 2.x golden paths above stay bit-for-bit.
-PROMOTED_KWARGS = dict(
-    corr_half_lives=[43.25, 173.0, 692.0],
-    corr_theta=0.5,
-    shrinkage="auto",
-    shrinkage_target="cluster",
-    kappa_mode="adaptive",
-    alpha_rule="selftuning",
-    level_match=False,
-    detector=True,
-    clock="asset",
-    vol_ladder=True,
-    weights="eg_blend",
-)
-
-# The 3.1 candidate: the promoted configuration with the learned shrinkage
-# split (each timescale's raw / equicorrelation / Schur-square experts
-# weighted by the blend gradient from the intensity rule's prior).
-SPLIT_KWARGS = dict(PROMOTED_KWARGS, split_learn=True)
-
-# The 3.2 promoted configuration: 3.1 with the joint observation weight
-# omega = n/m on each day's correlation innovation (what ``SqueezeKernel``
-# builds from 3.2 on).
-TYLER_KWARGS = dict(SPLIT_KWARGS, obs_weight="tyler")
+# The estimator at an anchor half-life of exactly 173 days: timescales (43.25, 173, 692).
+LAM = 2.0 ** (-1.0 / 173.0)
 
 
 def _block_returns(rng, t, within=0.6, cross=0.0):

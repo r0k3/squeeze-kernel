@@ -1,5 +1,19 @@
 # Changelog
 
+## 4.0.0 — unreleased
+
+The library ships the estimator and nothing else.  Output is bit-identical
+to 3.2.0 on every day (checked on the 300-stock example panel, a 121-future
+panel with listings and gaps, and a synthetic panel with missing values).
+
+- **Removed** ``SqueezeKernelEstimator``, ``SqueezeKernel.v1``,
+  ``CONSTANTS`` / ``StructuralConstants`` and ``kernel_fisher``: the v1
+  estimator and every ablation and reproduction switch.  The public API is
+  ``SqueezeKernel(lam)`` and ``estimate_squeeze_cov``.  Code that needs the
+  switch surface pins ``squeeze-kernel<4``.
+- Output is identical with and without SciPy (the NumPy-only path was
+  checked against 3.2.0 the same way).
+
 ## 3.2.0 — 2026-09-29
 
 The joint observation weight.  Same public surface, ``SqueezeKernel(lam)``;

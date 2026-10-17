@@ -1,10 +1,10 @@
 """The blend-gradient's spectral floor is skipped only on certified days,
-and a certified day is bit-identical to the floored path (3.1.1)."""
+and a certified day is bit-identical to the floored path."""
 
 import numpy as np
 import pytest
 
-import squeeze_kernel.estimator as E
+import squeeze_kernel.core as E
 from squeeze_kernel import SqueezeKernel
 
 
