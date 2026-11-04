@@ -125,3 +125,57 @@ def test_input_validation():
     sk.update(np.zeros(4) + 0.01)
     with pytest.raises(ValueError, match="Expected 4 assets"):
         sk.update(np.zeros(5))
+
+
+def test_diagnostics_do_not_touch_output():
+    """rung_correlations() and the diagnostic state are read-only views."""
+    rng = np.random.default_rng(3)
+    X = rng.normal(0, 0.01, size=(200, 8)) + rng.normal(0, 0.01, size=(200, 1))
+    a, b = SqueezeKernel(), SqueezeKernel()
+    for r in X:
+        a.update(r)
+        b.update(r)
+        b.rung_correlations()
+        b.state()
+    np.testing.assert_array_equal(a.covariance(), b.covariance())
+
+
+def test_rung_correlations():
+    rng = np.random.default_rng(4)
+    X = rng.normal(0, 0.01, size=(300, 10)) + rng.normal(0, 0.01, size=(300, 1))
+    X[:120, 9] = np.nan                         # a late listing
+    sk = SqueezeKernel()
+    with pytest.raises(RuntimeError):
+        sk.rung_correlations()
+    for r in X:
+        sk.update(r)
+    R = sk.rung_correlations()
+    assert R.shape == (3, 10, 10)
+    for C in R:
+        np.testing.assert_allclose(np.diag(C), 1.0)
+        np.testing.assert_allclose(C, C.T)
+        assert np.linalg.eigvalsh(C).min() > -1e-12
+
+
+def test_day_diagnostics():
+    rng = np.random.default_rng(5)
+    n = 12
+    X = rng.normal(0, 0.01, size=(300, n)) + rng.normal(0, 0.01, size=(300, 1))
+    X[:150, 11] = np.nan                        # a late listing
+    X[200, 3] = np.nan
+    sk = SqueezeKernel()
+    for r in X[:200]:
+        sk.update(r)
+    st = sk.state()
+    assert st["n_t"] == n and np.isclose(st["omega_t"], st["n_t"] / st["m_t"])
+    sk.update(X[200])
+    st = sk.state()
+    assert st["n_t"] == n - 1                   # m_t is on the observed subvector
+    w = st["clock_t"]
+    assert w.shape == (n,) and np.all((w >= 0) & (w < 1))
+    nu = st["asset_nu"]
+    assert nu.shape == (3, n) and np.all(nu > 0)
+    assert nu[2, 11] < nu[2, :11].min()          # the late listing has less history on the slow timescale
+    assert sk.update(np.full(n, np.nan)) == 0.0
+    st = sk.state()
+    assert np.isnan(st["m_t"]) and np.all(st["clock_t"] == 0.0)

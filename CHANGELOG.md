@@ -1,5 +1,21 @@
 # Changelog
 
+## 4.1.0 — unreleased
+
+Read-only diagnostics; the forecast is bit-identical to 4.0.0 on every day
+(checked on the 300-stock example panel, a 121-future panel with listings
+and gaps, and a synthetic panel with missing values).
+
+- ``SqueezeKernel.rung_correlations()``: the raw, unshrunk correlation
+  state of each timescale, shape (3, n, n).
+- ``state()`` adds ``m_t`` and ``n_t`` (the day's Mahalanobis distance
+  under the previous forecast and the observed count it is taken on; NaN
+  on a day the mixture abstains), ``clock_t`` (the day's per-asset clock
+  increments) and ``asset_nu`` (per-asset effective sizes per timescale,
+  counting only the days each asset was observed).
+- README: a Diagnostics section, with what the fast timescale's effective
+  size means and a whitening snippet.
+
 ## 4.0.0 — 2026-10-17
 
 The library ships the estimator and nothing else.  Output is bit-identical

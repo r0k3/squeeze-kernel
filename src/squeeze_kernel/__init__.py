@@ -27,4 +27,4 @@ from squeeze_kernel.batch import estimate_squeeze_cov
 
 __all__ = ["SqueezeKernel", "estimate_squeeze_cov"]
 
-__version__ = "4.0.0"
+__version__ = "4.1.0"

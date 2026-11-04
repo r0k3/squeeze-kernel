@@ -268,6 +268,10 @@ class _Engine:
         # per-asset market clocks: each asset's trading time advances with
         # the squared surprise of its correlation neighbourhood
         self._S_asset = np.full((K, n), float(eps))
+        # diagnostic only: information masses of each asset's observed days
+        self._S_obs = np.full((K, n), float(eps))
+        self._J_obs = np.full((K, n), float(eps))
+        self._w_asset = np.zeros(n)                   # the day's per-asset clock increments
         self._kap_asset = np.ones(n)
         self._C_prev = np.eye(n)
         self._detector = _BlendGradient(hl, self._corr_w)
@@ -366,6 +370,7 @@ class _Engine:
                 finite,
                 self._kap_lam * kap_a + (1.0 - self._kap_lam) * a_act,
                 kap_a)
+        self._w_asset = np.zeros(n) if w_vec is None else w_vec
         # observation weight: sqrt(omega) on the innovation, omega = n/m
         # from the gradient's own solve of the forecast at r_t; one on a
         # day the gradient abstained.
@@ -375,7 +380,11 @@ class _Engine:
             if np.isfinite(m_day) and m_day > 1e-12:
                 sq_omega = float(np.sqrt(detector.n_last / m_day))
         self._last_omega = sq_omega * sq_omega
+        # a missing asset's clock runs on the panel clock but adds nothing to its correlations
+        w_obs = np.where(finite, self._w_asset, 0.0)
         for k in range(corr_lam.size):
+            self._S_obs[k] = corr_lam[k] * self._S_obs[k] + w_obs
+            self._J_obs[k] = corr_lam[k] * corr_lam[k] * self._J_obs[k] + w_obs
             S_list[k] = corr_lam[k] * S_list[k] + w_t
             J_list[k] = corr_lam[k] * corr_lam[k] * J_list[k] + w_t
             if w_vec is not None:
@@ -415,18 +424,24 @@ class _Engine:
         s_ = max(0.0, 1.0 / max(c_k, eps) - 1.0)
         return min(1.0, c_k) / (1.0 + r_ * r_ * s_)
 
-    def _rung_experts(self, Q: np.ndarray, S_t: float, J_t: float
-                      ) -> tuple[tuple[np.ndarray, ...], np.ndarray]:
-        """The three PSD unit-diagonal experts of one timescale -- raw
-        correlation, equicorrelation at its mean level, Schur square --
-        and the rule's prior split (1-a, a(1-a), a^2)."""
+    def _raw_corr(self, Q: np.ndarray) -> np.ndarray:
+        """One timescale's state normalised to a correlation (unshrunk);
+        an asset never observed has a zero row and a zero diagonal."""
         eps = self.epsilon
-        n = self.n_assets
         diag_z = np.diagonal(Q).copy()
         inv_diag = 1.0 / np.sqrt(np.maximum(diag_z, eps))
         corr = np.multiply.outer(inv_diag, inv_diag)
         corr *= Q
         np.fill_diagonal(corr, np.where(diag_z > eps, 1.0, 0.0))
+        return np.asarray(corr)
+
+    def _rung_experts(self, Q: np.ndarray, S_t: float, J_t: float
+                      ) -> tuple[tuple[np.ndarray, ...], np.ndarray]:
+        """The three PSD unit-diagonal experts of one timescale -- raw
+        correlation, equicorrelation at its mean level, Schur square --
+        and the rule's prior split (1-a, a(1-a), a^2)."""
+        n = self.n_assets
+        corr = self._raw_corr(Q)
         a = self._intensity(corr, S_t, J_t)
         rho = (corr.sum() - n) / self._n_off
         rho = float(min(max(rho, -0.99 / max(n - 1, 1)), 0.999))
@@ -539,10 +554,26 @@ class SqueezeKernel:
             raise RuntimeError("Call update() at least once first.")
         return self._est._corr.copy()
 
+    def rung_correlations(self) -> np.ndarray:
+        """Raw (unshrunk) correlation state of each timescale, fastest
+        first, shape (3, n, n).  Diagnostics, not forecasts: the emitted
+        forecast pools each of these with its shrinkage targets, and a
+        timescale whose effective size (``state()["rung_nu"]``) is below n
+        is close to singular."""
+        if self._est is None:
+            raise RuntimeError("Call update() at least once first.")
+        return np.array([self._est._raw_corr(Q) for Q in self._est._Q_list])
+
     def state(self) -> dict[str, object]:
         """Diagnostics: update count, last kernel weight, kernel scale,
-        per-timescale information masses and effective sizes, blend tilt,
-        pool splits and the last observation weight."""
+        per-timescale information masses and effective sizes (panel clock),
+        blend tilt, pool splits, the last observation weight, the day's
+        Mahalanobis distance ``m_t`` under the previous forecast on its
+        ``n_t`` observed assets (NaN on a day the mixture abstained), the
+        day's per-asset clock increments ``clock_t`` (the panel clock for a
+        missing asset) and the per-asset effective sizes ``asset_nu``
+        (shape (3, n)): S^2/J of each asset's clock increments on the days
+        it was observed, on each timescale's decay."""
         if self._est is None:
             return {"n_assets": None, "t": 0}
         est = self._est
@@ -560,4 +591,8 @@ class SqueezeKernel:
             "detector_tilt": det.tilt,
             "split": det.v.copy(),
             "omega_t": est._last_omega,
+            "m_t": det.m_last,
+            "n_t": det.n_last,
+            "clock_t": est._w_asset.copy(),
+            "asset_nu": est._S_obs ** 2 / np.maximum(est._J_obs, est.epsilon),
         }

@@ -144,6 +144,30 @@ Missing values: pass `NaN` (or `mask=` on `update`). Newly listed, delisted or h
 
 Units: pass returns in decimal units (`0.01` = 1%). The numerical floors are absolute (`ε = 1e-8` in squared-return units), so percent-unit returns give a different path. A panel whose first day carries many exact-zero returns starts with a transient that the slow timescale remembers; start a day later.
 
+### Diagnostics
+
+Read-only views of state the estimator already keeps; none changes the forecast.
+
+```python
+sk.rung_correlations()   # (3, n, n) raw, unshrunk correlation state per timescale, fastest first
+st = sk.state()
+st["m_t"], st["n_t"]     # the day's Mahalanobis distance under the previous forecast, on n_t observed assets
+st["clock_t"]            # the day's per-asset clock increments, in [0, 1)
+st["rung_nu"]            # effective size per timescale (panel clock)
+st["asset_nu"]           # (3, n) effective sizes per asset, counting only the days it was observed
+```
+
+The fastest timescale forgets with a calendar half-life of a quarter of the anchor's, about 43 days at the default `lam`. Days enter with clock weights below one, so its effective size is smaller than a plain exponential average's: a median of 89 against 125 on the 300-stock example panel. The per-timescale states are raw correlations; the forecast pools each with its shrinkage targets, and a timescale whose effective size is below `n` is close to singular, so use them as diagnostics, not as forecasts.
+
+To whiten a return against the current forecast (under a correctly specified elliptical model its direction is uniform on the sphere):
+
+```python
+import scipy.linalg
+
+L = np.linalg.cholesky(sk.covariance())
+u = scipy.linalg.solve_triangular(L, r, lower=True)   # u @ u is the Mahalanobis distance
+```
+
 ## How it works
 
 ```mermaid
